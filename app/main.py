@@ -5,11 +5,23 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Response, Security, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    Security,
+    status,
+)
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.firewall import MCPFirewall
+from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
 from app.metrics import metrics_registry
 from app.policy import PolicyEngine
 from app.schemas import (
@@ -26,6 +38,7 @@ policy_engine = PolicyEngine.from_path(settings.policy_path)
 if settings.policy_path is None:
     logger.warning("AEGIS_POLICY_PATH is not set: RBAC matrix defaults to allow-all.")
 firewall = MCPFirewall(policy_engine=policy_engine)
+jsonrpc_gateway = JsonRpcGateway(firewall=firewall)
 
 
 @asynccontextmanager
@@ -173,3 +186,36 @@ def replace_policies(document: PolicyDocument) -> PolicyDocument:
         len(document.rules),
     )
     return policy_engine.document
+
+
+async def read_body_capped(request: Request, limit: int) -> bytes:
+    """Read at most ``limit + 1`` bytes so oversized bodies are never buffered."""
+    buffer = bytearray()
+    async for chunk in request.stream():
+        buffer.extend(chunk)
+        if len(buffer) > limit:
+            break
+    return bytes(buffer)
+
+
+@app.post(
+    "/api/v1/mcp/jsonrpc",
+    dependencies=[Depends(verify_api_key)],
+    tags=["MCP Firewall"],
+    response_class=JSONResponse,
+)
+async def mcp_jsonrpc_proxy(
+    request: Request,
+    x_aegis_agent_id: str | None = Header(default=None),
+    x_aegis_mcp_server: str | None = Header(default=None),
+    x_aegis_environment: str | None = Header(default=None),
+) -> JSONResponse:
+    """Firewall, audit, and proxy a JSON-RPC 2.0 MCP request to its upstream."""
+    raw = await read_body_capped(request, MAX_REQUEST_BYTES)
+    routing = {
+        "agent_id": x_aegis_agent_id,
+        "server_name": x_aegis_mcp_server,
+        "environment": x_aegis_environment,
+    }
+    payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
+    return JSONResponse(payload)
