@@ -29,6 +29,12 @@ class MetricsRegistry:
             for category in redacted_categories:
                 self._redactions_total[category] += 1
 
+    def record_redactions(self, redacted_categories: list[str]) -> None:
+        """Record DLP redactions applied outside an inspection (e.g. responses)."""
+        with self._lock:
+            for category in redacted_categories:
+                self._redactions_total[category] += 1
+
     def generate_prometheus_exposition(self) -> str:
         """Serialize registered metrics to Prometheus text exposition format (0.0.4)."""
         with self._lock:

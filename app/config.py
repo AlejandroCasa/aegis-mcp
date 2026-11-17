@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     block_threshold_score: int = 70
     enable_dlp_redaction: bool = True
     policy_path: str | None = None
+    mcp_upstreams: dict[str, str] = Field(default_factory=dict)
+    upstream_timeout_seconds: float = 10.0
 
 
 settings = Settings()
