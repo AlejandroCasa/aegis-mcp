@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any, Literal
 
 from app.config import settings
+from app.policy import RBAC_RISK_SCORE, RBAC_VIOLATION, PolicyEngine
 from app.redactor import redact_payload
 from app.schemas import (
     AuditEntry,
@@ -90,10 +91,29 @@ def evaluate_threats(payload_text: str) -> tuple[int, list[str]]:
 class MCPFirewall:
     """Inspects MCP tool calls, applies DLP redaction, and maintains a hash chain."""
 
-    def __init__(self, db_path: str | None = None) -> None:
-        """Initialize SQLite tamper-evident audit ledger."""
+    def __init__(
+        self,
+        db_path: str | None = None,
+        policy_engine: PolicyEngine | None = None,
+    ) -> None:
+        """Initialize SQLite audit ledger and the RBAC policy engine."""
         self.db_path = db_path or settings.db_path
+        self.policy_engine = policy_engine or PolicyEngine.from_path(
+            settings.policy_path
+        )
         self._init_db()
+
+    def _apply_rbac(self, request: MCPToolCallRequest, violations: list[str]) -> bool:
+        """Append the RBAC violation if the matrix denies the call; return denial."""
+        denied = not self.policy_engine.is_allowed(
+            agent_id=request.agent_id,
+            server_name=request.server_name,
+            tool_name=request.tool_name,
+            environment=request.environment,
+        )
+        if denied:
+            violations.append(RBAC_VIOLATION)
+        return denied
 
     def _init_db(self) -> None:
         """Create the audit_ledger table if it does not exist."""
@@ -127,6 +147,9 @@ class MCPFirewall:
         """Inspect an MCP tool call, redact PII/secrets, and append to hash ledger."""
         raw_serialized = json.dumps(request.arguments, sort_keys=True)
         risk_score, violations = evaluate_threats(raw_serialized)
+        rbac_denied = self._apply_rbac(request, violations)
+        if rbac_denied:
+            risk_score = RBAC_RISK_SCORE
 
         sanitized_args: dict[str, Any] = dict(request.arguments)
         redacted_categories: list[str] = []
@@ -135,7 +158,7 @@ class MCPFirewall:
             if redacted_categories and risk_score < 25:
                 risk_score = 25
 
-        allowed = risk_score < settings.block_threshold_score
+        allowed = risk_score < settings.block_threshold_score and not rbac_denied
         decision: Literal["ALLOWED", "SANITIZED", "BLOCKED"] = "ALLOWED"
         if not allowed:
             decision = "BLOCKED"

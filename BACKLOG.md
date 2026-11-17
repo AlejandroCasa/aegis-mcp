@@ -5,7 +5,6 @@ This file tracks prioritized engineering improvements, technical debt, and compl
 ## 🎯 Prioritized Backlog (Sprint 2026-W48)
 
 ### P0 — Core Governance & Policy Engine
-- [ ] **[rbac-policy]** Declarative Per-Agent & Per-Server RBAC Policy Matrix (`POST /api/v1/policies` & YAML loader): Enforce fine-grained tool allowlists/denylists per `agent_id` and `environment` (`dev`/`staging`/`prod`) so untrusted agents cannot invoke write/admin MCP tools (Impact: 5/5 | Effort: S)
 - [ ] **[jsonrpc-proxy]** Native JSON-RPC 2.0 MCP Wire-Protocol Envelope Endpoint (`POST /api/v1/mcp/jsonrpc`): Support full JSON-RPC 2.0 `tools/call`, `resources/read`, and `prompts/get` envelopes with bidirectional response DLP redaction (Impact: 5/5 | Effort: M)
 
 ### P1 — Threat Intelligence & Observability
@@ -19,3 +18,4 @@ This file tracks prioritized engineering improvements, technical debt, and compl
 
 ## ✅ Completed Milestones
 - [x] **[core/init]** Project initialization (`v0.1.0`) with Zero-Trust MCP Firewall (`app/firewall.py`), deterministic DLP Redactor (`app/redactor.py`), SHA-256 Hash-Chained SQLite Audit Ledger, Prometheus `/metrics`, Atheris fuzzing harness (`fuzz/fuzz_firewall.py`), traffic simulator (`scripts/simulate_mcp_traffic.py`), hardened multi-stage `Dockerfile` (`UID 10001`), K8s manifests (`k8s/`), OPA/Rego policies (`policy/`), and 4-Phase CI/CD pipeline (`[[ADR-0021-aegis-mcp-zero-trust-firewall-and-hash-chain-audit]]`) — Branch: `main` (`2026-11-17`)
+- [x] **[rbac-policy]** Declarative Per-Agent & Per-Server RBAC Policy Matrix (`app/policy.py`): deny-overrides `fnmatch` glob matrix scoped by `agent_id`, `server_name`, and `environment` (`dev`/`staging`/`prod`); fail-closed `yaml.safe_load` loader via `AEGIS_POLICY_PATH`; `GET`/`POST /api/v1/policies` (POST requires a configured `AEGIS_API_KEY`); unauthorized calls `BLOCKED` with `rbac_policy_denied` (risk `100`) in `MCPFirewall.inspect` — Branch: `feat/rbac-policy-matrix` (`2026-11-17`)
