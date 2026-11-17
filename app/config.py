@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     db_path: str = Field(default_factory=_default_db_path)
     block_threshold_score: int = 70
     enable_dlp_redaction: bool = True
+    policy_path: str | None = None
 
 
 settings = Settings()
