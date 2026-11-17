@@ -1,0 +1,82 @@
+{
+  "env": {
+    "AEGIS_DB_PATH": ".aegis_claude_audit.db",
+    "AEGIS_BLOCK_THRESHOLD_SCORE": "70",
+    "AEGIS_ENABLE_DLP_REDACTION": "true"
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "Glob",
+      "Grep",
+      "LS",
+      "Task",
+      "Bash(uv run *)",
+      "Bash(uv sync *)",
+      "Bash(uv add *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git checkout -b *)",
+      "Bash(git switch -c *)",
+      "Bash(git add *)",
+      "Bash(git commit -m *)",
+      "Bash(docker build *)"
+    ],
+    "deny": [
+      "Bash(git push origin main*)",
+      "Bash(git push origin master*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git commit --no-verify*)",
+      "Bash(git commit -n*)",
+      "Bash(pip *)",
+      "Bash(pip3 *)",
+      "Bash(rm -rf *)",
+      "Edit(.claude/**)",
+      "Edit(.pre-commit-config.yaml)",
+      "Edit(AGENTS.md)",
+      "Edit(CLAUDE.md)",
+      "Edit(app/claude_guard.py)",
+      "Edit(scripts/claude_aegis_guard.py)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-sync python scripts/claude_aegis_guard.py pre-tool"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-sync python scripts/claude_aegis_guard.py post-tool"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-sync python scripts/claude_aegis_guard.py stop-gate"
+          }
+        ]
+      }
+    ]
+  }
+}
