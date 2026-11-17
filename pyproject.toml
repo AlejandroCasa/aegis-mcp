@@ -1,0 +1,92 @@
+[project]
+name = "aegis-mcp"
+version = "0.1.0"
+description = "Zero-Trust Firewall, DLP Redactor & Cryptographic Audit Proxy for Model Context Protocol (MCP) Servers."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.0.0",
+    "uvicorn[standard]>=0.34.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "atheris>=2.3.0; sys_platform == 'linux'",
+    "bandit[toml]>=1.8.0",
+    "black>=24.10.0",
+    "commitizen>=4.19.3",
+    "isort>=5.13.2",
+    "mutmut>=3.2.0",
+    "mypy>=1.14.0",
+    "pip-audit>=2.7.3",
+    "pre-commit>=4.7.0",
+    "pytest>=8.3.4",
+    "pytest-cov>=6.0.0",
+    "radon>=6.0.1",
+    "ruff>=0.9.0",
+    "xenon>=0.9.3",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:pkg_resources",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+skip_glob = ["mutants/*", ".venv/*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM", "RUF"]
+
+[tool.mutmut]
+source_paths = ["app/firewall.py", "app/redactor.py"]
+also_copy = ["app", "scripts", "fuzz"]
+pytest_add_cli_args = ["-q"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version_provider = "pep621"

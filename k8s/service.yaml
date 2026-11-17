@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-mcp
+  labels:
+    app: aegis-mcp
+    app.kubernetes.io/name: aegis-mcp
+    app.kubernetes.io/part-of: aegis-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: aegis-mcp
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
