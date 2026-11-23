@@ -355,7 +355,12 @@ class JsonRpcGateway:
     def _inspect(
         self, context: CallContext, tool_name: str, params: dict[str, Any]
     ) -> MCPInspectionResponse:
-        """Run threat rules, RBAC, inbound DLP, and the audit ledger."""
+        """Run threat rules, RBAC, argument ABAC, inbound DLP, and the ledger.
+
+        Argument constraints see the tool/prompt ``params.arguments`` object
+        (``resources/read`` exposes ``params`` itself, i.e. its ``uri``).
+        """
+        nested = params.get("arguments")
         report = self.firewall.inspect(
             MCPToolCallRequest(
                 agent_id=context.agent_id,
@@ -363,7 +368,8 @@ class JsonRpcGateway:
                 tool_name=tool_name,
                 arguments=params,
                 environment=context.environment,
-            )
+            ),
+            constraint_arguments=nested if isinstance(nested, dict) else params,
         )
         metrics_registry.record_inspection(
             server_name=context.server_name,

@@ -212,6 +212,100 @@ class PolicyRule(BaseModel):
         return self
 
 
+ArgumentName = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+"""Top-level tool argument key inspected by an argument constraint."""
+
+AllowedPath = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+"""Absolute filesystem root; canonicalized with ``realpath`` at evaluation."""
+
+DomainPattern = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=253,
+        pattern=r"^(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$",
+    ),
+]
+"""Egress host: exact ``example.com`` or any subdomain via ``*.example.com``."""
+
+MAX_CONSTRAINT_BYTES = 67_108_864
+
+
+def _default_path_args() -> list[str]:
+    """Argument keys treated as filesystem paths by default."""
+    return ["path", "paths", "file", "file_path", "filename", "directory"]
+
+
+def _default_sql_args() -> list[str]:
+    """Argument keys treated as SQL statements by default."""
+    return ["query", "sql", "statement"]
+
+
+def _default_url_args() -> list[str]:
+    """Argument keys treated as outbound URLs by default."""
+    return ["url", "uri", "endpoint", "href"]
+
+
+class ToolConstraint(BaseModel):
+    """Argument-level ABAC constraint for tools matched by scope globs.
+
+    Every matching constraint applies (logical AND). Constrained argument keys
+    holding a non-string value fail closed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: GlobPattern = Field(default="*", description="Agent glob.")
+    server_name: GlobPattern = Field(default="*", description="Server glob.")
+    tool_name: GlobPattern = Field(default="*", description="Tool-name glob.")
+    environments: list[Environment] = Field(
+        default_factory=_all_environments, min_length=1, max_length=3
+    )
+    path_allow: list[AllowedPath] = Field(
+        default_factory=list,
+        max_length=64,
+        description="Allowed roots; paths are realpath-canonicalized (anti-symlink).",
+    )
+    path_args: list[ArgumentName] = Field(
+        default_factory=_default_path_args, max_length=64
+    )
+    sql_mode: Literal["read_only"] | None = Field(
+        default=None, description="``read_only`` allows a single SELECT/WITH."
+    )
+    sql_args: list[ArgumentName] = Field(
+        default_factory=_default_sql_args, max_length=64
+    )
+    egress_allow: list[DomainPattern] = Field(
+        default_factory=list,
+        max_length=256,
+        description="Allowed http(s) destination hosts for URL arguments.",
+    )
+    url_args: list[ArgumentName] = Field(
+        default_factory=_default_url_args, max_length=64
+    )
+    max_bytes: int | None = Field(
+        default=None, ge=1, le=MAX_CONSTRAINT_BYTES, description="Serialized cap."
+    )
+    max_items: int | None = Field(
+        default=None, ge=0, le=1_000_000, description="Max elements per array."
+    )
+
+    @model_validator(mode="after")
+    def _validate_constraint(self) -> "ToolConstraint":
+        """Reject no-op constraints and relative allow roots."""
+        if not (
+            self.path_allow
+            or self.sql_mode
+            or self.egress_allow
+            or self.max_bytes is not None
+            or self.max_items is not None
+        ):
+            raise ValueError("Tool constraint must declare at least one limit.")
+        if not all(root.startswith("/") for root in self.path_allow):
+            raise ValueError("path_allow roots must be absolute paths.")
+        return self
+
+
 class PolicyStatus(BaseModel):
     """Operational state of the active policy (version, mode, fail-closed)."""
 
@@ -236,4 +330,9 @@ class PolicyDocument(BaseModel):
         default_factory=list,
         max_length=1024,
         description="Ordered RBAC rules (evaluation is order-independent).",
+    )
+    tool_constraints: list[ToolConstraint] = Field(
+        default_factory=list,
+        max_length=1024,
+        description="Argument-level ABAC constraints (all matching apply).",
     )

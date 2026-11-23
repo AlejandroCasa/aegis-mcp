@@ -38,6 +38,27 @@ Aegis-MCP sits between AI Agents (Claude Desktop, Cursor, autonomous orchestrato
 | `AEGIS_POLICY_MODE` | `enforce` | `enforce` blocks; `monitor` (shadow mode) evaluates and audits `would_block=true` without blocking, for progressive rollouts (`aegis_mcp_shadow_would_block_total`). |
 | `AEGIS_POLICY_PATH` | unset | YAML RBAC/ABAC policy. Every decision records `policy_version` = SHA-256 of the RFC 8785 (JCS) canonical document (`GET /api/v1/policies/status`). |
 
+### Argument-level ABAC (`tool_constraints`)
+
+```yaml
+default_action: deny
+rules:
+  - server_name: "postgres-mcp"
+    allow_tools: ["query"]
+tool_constraints:
+  - server_name: "filesystem-mcp"
+    path_allow: ["/srv/workspace"]   # realpath-canonicalized: symlink / dot-dot escapes blocked
+  - server_name: "postgres-mcp"
+    tool_name: "query"
+    sql_mode: read_only              # one SELECT/WITH, no write/DDL tokens outside literals
+  - tool_name: "fetch"
+    egress_allow: ["api.github.com", "*.example.org"]
+    max_bytes: 65536
+    max_items: 100
+```
+
+Violations (`argument_path_not_allowed`, `argument_sql_not_read_only`, `argument_egress_not_allowed`, `argument_max_bytes_exceeded`, `argument_max_items_exceeded`) block with risk `100`. Constrained keys default to `path`/`file`/`file_path`/`filename`/`directory`, `query`/`sql`/`statement` and `url`/`uri`/`endpoint`/`href` (override via `path_args`, `sql_args`, `url_args`).
+
 ---
 
 ## 🚀 Quick Start & Local Simulation

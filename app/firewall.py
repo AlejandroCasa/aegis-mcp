@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from app.config import settings
+from app.constraints import evaluate_constraints
 from app.policy import (
     FAIL_CLOSED_VIOLATION,
     RBAC_RISK_SCORE,
@@ -129,27 +130,36 @@ class MCPFirewall:
         )
         self._init_db()
 
-    def _apply_rbac(
-        self, request: MCPToolCallRequest, violations: list[str]
+    def _apply_policy(
+        self,
+        request: MCPToolCallRequest,
+        violations: list[str],
+        constraint_arguments: dict[str, Any] | None,
     ) -> tuple[bool, str]:
-        """Evaluate RBAC against one atomic policy snapshot.
+        """Evaluate RBAC and argument ABAC against one atomic policy snapshot.
 
         Appends ``rbac_policy_denied`` (plus ``policy_fail_closed`` under the
-        startup deny-all fallback) and returns ``(denied, policy_version)``.
+        startup deny-all fallback) and any ``argument_*`` constraint codes;
+        returns ``(denied, policy_version)``.
         """
         document, version, fail_closed = self.policy_engine.snapshot()
-        denied = not evaluate_policy(
-            document,
-            agent_id=request.agent_id,
-            server_name=request.server_name,
-            tool_name=request.tool_name,
-            environment=request.environment,
+        scope = (
+            request.agent_id,
+            request.server_name,
+            request.tool_name,
+            request.environment,
         )
-        if denied:
+        rbac_denied = not evaluate_policy(document, *scope)
+        if rbac_denied:
             violations.append(RBAC_VIOLATION)
             if fail_closed:
                 violations.append(FAIL_CLOSED_VIOLATION)
-        return denied, version
+        subject = (
+            request.arguments if constraint_arguments is None else constraint_arguments
+        )
+        argument_violations = evaluate_constraints(document, scope, subject)
+        violations.extend(argument_violations)
+        return rbac_denied or bool(argument_violations), version
 
     @staticmethod
     def _decide(
@@ -205,12 +215,24 @@ class MCPFirewall:
         row = cursor.fetchone()
         return str(row[0]) if row else GENESIS_HASH
 
-    def inspect(self, request: MCPToolCallRequest) -> MCPInspectionResponse:
-        """Inspect an MCP tool call, redact PII/secrets, and append to hash ledger."""
+    def inspect(
+        self,
+        request: MCPToolCallRequest,
+        constraint_arguments: dict[str, Any] | None = None,
+    ) -> MCPInspectionResponse:
+        """Inspect an MCP tool call, redact PII/secrets, and append to hash ledger.
+
+        ``constraint_arguments`` selects the object argument constraints apply
+        to when ``request.arguments`` wraps it (e.g. JSON-RPC ``tools/call``
+        params carry the tool arguments under ``params.arguments``); threat
+        rules and DLP always scan the full ``request.arguments``.
+        """
         raw_serialized = json.dumps(request.arguments, sort_keys=True)
         risk_score, violations = evaluate_threats(raw_serialized)
-        rbac_denied, version = self._apply_rbac(request, violations)
-        if rbac_denied:
+        policy_denied, version = self._apply_policy(
+            request, violations, constraint_arguments
+        )
+        if policy_denied:
             risk_score = RBAC_RISK_SCORE
 
         sanitized_args: dict[str, Any] = dict(request.arguments)
@@ -221,7 +243,7 @@ class MCPFirewall:
                 risk_score = 25
 
         allowed, decision, would_block = self._decide(
-            risk_score, rbac_denied, bool(redacted_categories)
+            risk_score, policy_denied, bool(redacted_categories)
         )
         mode = settings.policy_mode
         ts_iso = request.timestamp.isoformat()
