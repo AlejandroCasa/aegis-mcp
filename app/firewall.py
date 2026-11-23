@@ -1,22 +1,51 @@
 """Zero-Trust MCP Firewall and SHA-256 hash-chained SQLite audit ledger."""
 
-import hashlib
 import json
 import re
-import sqlite3
-from typing import Any, Literal
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 from app.config import settings
-from app.policy import RBAC_RISK_SCORE, RBAC_VIOLATION, PolicyEngine
+from app.constraints import evaluate_constraints
+from app.ledger import (
+    GENESIS_HASH,
+    AuditLedger,
+    LedgerRecord,
+    compute_entry_hash,
+    compute_entry_hash_v2,
+    digest_arguments,
+)
+from app.normalize import detection_views
+from app.policy import (
+    FAIL_CLOSED_VIOLATION,
+    RBAC_RISK_SCORE,
+    RBAC_VIOLATION,
+    PolicyEngine,
+    build_policy_engine,
+    evaluate_policy,
+)
 from app.redactor import redact_payload
 from app.schemas import (
     AuditEntry,
     ChainVerificationResponse,
+    Decision,
     MCPInspectionResponse,
     MCPToolCallRequest,
 )
 
-GENESIS_HASH = "0" * 64
+__all__ = [
+    "GENESIS_HASH",
+    "LedgerRecord",
+    "MCPFirewall",
+    "compute_entry_hash",
+    "compute_entry_hash_v2",
+    "evaluate_threats",
+]
+
+OBFUSCATION_VIOLATION = "obfuscated_payload"
+DECODE_BUDGET_VIOLATION = "decode_budget_exceeded"
+DECODE_BUDGET_RISK_SCORE = 50
 
 THREAT_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
     (
@@ -57,34 +86,39 @@ THREAT_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
 )
 
 
-def compute_entry_hash(
-    prev_hash: str,
-    timestamp_iso: str,
-    agent_id: str,
-    server_name: str,
-    tool_name: str,
-    decision: str,
-    risk_score: int,
-) -> str:
-    """Compute deterministic SHA-256 hash linking the audit record to prev_hash."""
-    canonical = (
-        f"{prev_hash}|{timestamp_iso}|{agent_id}|"
-        f"{server_name}|{tool_name}|{decision}|{risk_score}"
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+def _match_rule(pattern: re.Pattern[str], views: list[str]) -> tuple[bool, bool]:
+    """Return ``(matched, hidden)``: hidden means no match in the raw view."""
+    if pattern.search(views[0]):
+        return True, False
+    hidden = any(pattern.search(view) for view in views[1:])
+    return hidden, hidden
 
 
 def evaluate_threats(payload_text: str) -> tuple[int, list[str]]:
-    """Scan serialized tool arguments against deterministic Zero-Trust threat rules."""
+    """Scan tool arguments against Zero-Trust threat rules after canonicalization.
+
+    Rules run on every detection view (raw, Unicode-folded, percent/HTML
+    decoded, recursively Base64/hex decoded; see ``app/normalize.py``). A
+    match that only exists in a transformed view adds ``obfuscated_payload``;
+    running out of decode budget adds the advisory ``decode_budget_exceeded``.
+    """
+    analysis = detection_views(payload_text)
     violations: list[str] = []
     max_score = 0
+    obfuscated = False
 
     for rule_name, score, pattern in THREAT_RULES:
-        if pattern.search(payload_text):
+        matched, hidden = _match_rule(pattern, analysis.views)
+        if matched:
             violations.append(rule_name)
-            if score > max_score:
-                max_score = score
+            max_score = max(max_score, score)
+            obfuscated = obfuscated or hidden
 
+    if obfuscated:
+        violations.append(OBFUSCATION_VIOLATION)
+    if analysis.exhausted:
+        violations.append(DECODE_BUDGET_VIOLATION)
+        max_score = max(max_score, DECODE_BUDGET_RISK_SCORE)
     return max_score, violations
 
 
@@ -96,59 +130,96 @@ class MCPFirewall:
         db_path: str | None = None,
         policy_engine: PolicyEngine | None = None,
     ) -> None:
-        """Initialize SQLite audit ledger and the RBAC policy engine."""
+        """Initialize SQLite audit ledger and the RBAC policy engine.
+
+        Without an explicit engine the startup policy is built fail-closed:
+        ``AEGIS_ENVIRONMENT=prod`` with no valid policy denies every call.
+        """
         self.db_path = db_path or settings.db_path
-        self.policy_engine = policy_engine or PolicyEngine.from_path(
-            settings.policy_path
+        self.policy_engine = policy_engine or build_policy_engine(
+            settings.policy_path, settings.environment
         )
+        self.ledger = AuditLedger(self.db_path, wal=settings.ledger_wal)
         self._init_db()
 
-    def _apply_rbac(self, request: MCPToolCallRequest, violations: list[str]) -> bool:
-        """Append the RBAC violation if the matrix denies the call; return denial."""
-        denied = not self.policy_engine.is_allowed(
-            agent_id=request.agent_id,
-            server_name=request.server_name,
-            tool_name=request.tool_name,
-            environment=request.environment,
+    def _apply_policy(
+        self,
+        request: MCPToolCallRequest,
+        violations: list[str],
+        constraint_arguments: dict[str, Any] | None,
+    ) -> tuple[bool, str]:
+        """Evaluate RBAC and argument ABAC against one atomic policy snapshot.
+
+        Appends ``rbac_policy_denied`` (plus ``policy_fail_closed`` under the
+        startup deny-all fallback) and any ``argument_*`` constraint codes;
+        returns ``(denied, policy_version)``.
+        """
+        document, version, fail_closed = self.policy_engine.snapshot()
+        scope = (
+            request.agent_id,
+            request.server_name,
+            request.tool_name,
+            request.environment,
         )
-        if denied:
+        rbac_denied = not evaluate_policy(document, *scope)
+        if rbac_denied:
             violations.append(RBAC_VIOLATION)
-        return denied
+            if fail_closed:
+                violations.append(FAIL_CLOSED_VIOLATION)
+        subject = (
+            request.arguments if constraint_arguments is None else constraint_arguments
+        )
+        argument_violations = evaluate_constraints(document, scope, subject)
+        violations.extend(argument_violations)
+        return rbac_denied or bool(argument_violations), version
+
+    @staticmethod
+    def _decide(
+        risk_score: int, denied: bool, redacted: bool
+    ) -> tuple[bool, Decision, bool]:
+        """Map the evaluation to ``(allowed, decision, would_block)``.
+
+        In ``monitor`` (shadow) mode nothing is blocked: the call keeps its
+        ALLOWED/SANITIZED decision and ``would_block`` records the verdict
+        enforce mode would have reached.
+        """
+        would_block = denied or risk_score >= settings.block_threshold_score
+        if would_block and settings.policy_mode == "enforce":
+            return False, "BLOCKED", True
+        return True, "SANITIZED" if redacted else "ALLOWED", would_block
 
     def _init_db(self) -> None:
-        """Create the audit_ledger table if it does not exist."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS audit_ledger (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL,
-                    server_name TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    decision TEXT NOT NULL,
-                    risk_score INTEGER NOT NULL,
-                    violations_json TEXT NOT NULL,
-                    redacted_json TEXT NOT NULL,
-                    prev_hash TEXT NOT NULL,
-                    entry_hash TEXT NOT NULL,
-                    timestamp TEXT NOT NULL
-                )
-                """)
-            conn.commit()
+        """Create/migrate the audit ledger (WAL, additive v1 -> v2 columns)."""
+        self.ledger.init()
 
-    def _get_last_hash(self, cursor: sqlite3.Cursor) -> str:
-        """Fetch the most recent entry_hash or return the genesis hash."""
-        cursor.execute("SELECT entry_hash FROM audit_ledger ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-        return str(row[0]) if row else GENESIS_HASH
+    def inspect(
+        self,
+        request: MCPToolCallRequest,
+        constraint_arguments: dict[str, Any] | None = None,
+        denials: Sequence[str] = (),
+        session_id: str = "",
+    ) -> MCPInspectionResponse:
+        """Inspect an MCP tool call, redact PII/secrets, and append to hash ledger.
 
-    def inspect(self, request: MCPToolCallRequest) -> MCPInspectionResponse:
-        """Inspect an MCP tool call, redact PII/secrets, and append to hash ledger."""
-        raw_serialized = json.dumps(request.arguments, sort_keys=True)
+        ``constraint_arguments`` selects the object argument constraints apply
+        to when ``request.arguments`` wraps it (e.g. JSON-RPC ``tools/call``
+        params carry the tool arguments under ``params.arguments``); threat
+        rules and DLP always scan the full ``request.arguments``.
+        ``denials`` are gateway-level violations (e.g. ``tool_definition_drift``)
+        that deny the call exactly like an RBAC denial. ``session_id`` (the
+        gateway ``Mcp-Session-Id``) and the JCS digest of the sanitized
+        arguments are bound into the v2 ledger hash.
+        """
+        raw_serialized = json.dumps(
+            request.arguments, sort_keys=True, ensure_ascii=False
+        )
         risk_score, violations = evaluate_threats(raw_serialized)
-        rbac_denied = self._apply_rbac(request, violations)
-        if rbac_denied:
+        violations.extend(denials)
+        policy_denied, version = self._apply_policy(
+            request, violations, constraint_arguments
+        )
+        policy_denied = policy_denied or bool(denials)
+        if policy_denied:
             risk_score = RBAC_RISK_SCORE
 
         sanitized_args: dict[str, Any] = dict(request.arguments)
@@ -158,50 +229,26 @@ class MCPFirewall:
             if redacted_categories and risk_score < 25:
                 risk_score = 25
 
-        allowed = risk_score < settings.block_threshold_score and not rbac_denied
-        decision: Literal["ALLOWED", "SANITIZED", "BLOCKED"] = "ALLOWED"
-        if not allowed:
-            decision = "BLOCKED"
-        elif redacted_categories:
-            decision = "SANITIZED"
-
-        ts_iso = request.timestamp.isoformat()
-
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            prev_hash = self._get_last_hash(cursor)
-            entry_hash = compute_entry_hash(
-                prev_hash=prev_hash,
-                timestamp_iso=ts_iso,
-                agent_id=request.agent_id,
-                server_name=request.server_name,
-                tool_name=request.tool_name,
-                decision=decision,
-                risk_score=risk_score,
-            )
-            cursor.execute(
-                """
-                INSERT INTO audit_ledger (
-                    agent_id, server_name, tool_name, environment,
-                    decision, risk_score, violations_json, redacted_json,
-                    prev_hash, entry_hash, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    request.agent_id,
-                    request.server_name,
-                    request.tool_name,
-                    request.environment,
-                    decision,
-                    risk_score,
-                    json.dumps(violations),
-                    json.dumps(redacted_categories),
-                    prev_hash,
-                    entry_hash,
-                    ts_iso,
-                ),
-            )
-            conn.commit()
+        allowed, decision, would_block = self._decide(
+            risk_score, policy_denied, bool(redacted_categories)
+        )
+        record = LedgerRecord(
+            agent_id=request.agent_id,
+            server_name=request.server_name,
+            tool_name=request.tool_name,
+            environment=request.environment,
+            decision=decision,
+            risk_score=risk_score,
+            violations=violations,
+            redacted_categories=redacted_categories,
+            timestamp=request.timestamp.isoformat(),
+            would_block=would_block,
+            policy_mode=settings.policy_mode,
+            policy_version=version,
+            session_id=session_id,
+            args_digest=digest_arguments(sanitized_args),
+        )
+        prev_hash, entry_hash = self._append(record)
 
         return MCPInspectionResponse(
             allowed=allowed,
@@ -213,88 +260,61 @@ class MCPFirewall:
             audit_hash=entry_hash,
             prev_hash=prev_hash,
             timestamp=request.timestamp,
+            would_block=would_block,
+            policy_mode=record.policy_mode,
+            policy_version=version,
         )
+
+    def record_event(
+        self,
+        scope: tuple[str, str, str, str],
+        violations: list[str],
+        risk_score: int = RBAC_RISK_SCORE,
+        session_id: str = "",
+    ) -> tuple[Decision, str]:
+        """Append a blocking gateway event (e.g. tool drift) to the hash chain.
+
+        ``scope`` is ``(agent_id, server_name, tool_name, environment)``. The
+        decision is ``BLOCKED`` in enforce mode and ``ALLOWED`` (with
+        ``would_block``) in monitor mode; returns ``(decision, entry_hash)``.
+        """
+        agent_id, server_name, tool_name, environment = scope
+        decision: Decision = (
+            "BLOCKED" if settings.policy_mode == "enforce" else "ALLOWED"
+        )
+        record = LedgerRecord(
+            agent_id=agent_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            environment=environment,
+            decision=decision,
+            risk_score=risk_score,
+            violations=list(violations),
+            redacted_categories=[],
+            timestamp=datetime.now(UTC).isoformat(),
+            would_block=True,
+            policy_mode=settings.policy_mode,
+            policy_version=self.policy_engine.version,
+            session_id=session_id,
+            args_digest=digest_arguments({}),
+        )
+        return decision, self._append(record)[1]
+
+    def _append(self, record: LedgerRecord) -> tuple[str, str]:
+        """Link ``record`` (v2) to the chain head; ``(prev_hash, entry_hash)``."""
+        return self.ledger.append(record)
 
     def list_audit_entries(self, agent_id: str | None = None) -> list[AuditEntry]:
         """Return persisted audit entries, optionally filtered by agent_id."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            if agent_id:
-                cursor.execute(
-                    "SELECT id, agent_id, server_name, tool_name, environment, "
-                    "decision, risk_score, violations_json, redacted_json, "
-                    "prev_hash, entry_hash, timestamp "
-                    "FROM audit_ledger WHERE agent_id = ? ORDER BY id ASC",
-                    (agent_id,),
-                )
-            else:
-                cursor.execute(
-                    "SELECT id, agent_id, server_name, tool_name, environment, "
-                    "decision, risk_score, violations_json, redacted_json, "
-                    "prev_hash, entry_hash, timestamp "
-                    "FROM audit_ledger ORDER BY id ASC"
-                )
-            rows = cursor.fetchall()
-
-        entries: list[AuditEntry] = []
-        for row in rows:
-            entries.append(
-                AuditEntry(
-                    id=int(row[0]),
-                    agent_id=str(row[1]),
-                    server_name=str(row[2]),
-                    tool_name=str(row[3]),
-                    environment=str(row[4]),
-                    decision=row[5],
-                    risk_score=int(row[6]),
-                    violations=list(json.loads(str(row[7]))),
-                    redacted_categories=list(json.loads(str(row[8]))),
-                    prev_hash=str(row[9]),
-                    entry_hash=str(row[10]),
-                    timestamp=str(row[11]),
-                )
-            )
-        return entries
+        return self.ledger.list_entries(agent_id)
 
     def verify_chain(self) -> ChainVerificationResponse:
-        """Verify cryptographic integrity of every SHA-256 link in the audit ledger."""
-        entries = self.list_audit_entries()
-        expected_prev = GENESIS_HASH
-
-        for entry in entries:
-            recomputed = compute_entry_hash(
-                prev_hash=expected_prev,
-                timestamp_iso=entry.timestamp,
-                agent_id=entry.agent_id,
-                server_name=entry.server_name,
-                tool_name=entry.tool_name,
-                decision=entry.decision,
-                risk_score=entry.risk_score,
-            )
-            if entry.prev_hash != expected_prev or entry.entry_hash != recomputed:
-                return ChainVerificationResponse(
-                    valid=False,
-                    total_entries=len(entries),
-                    head_hash=entries[-1].entry_hash,
-                    corrupted_entry_id=entry.id,
-                )
-            expected_prev = entry.entry_hash
-
-        return ChainVerificationResponse(
-            valid=True,
-            total_entries=len(entries),
-            head_hash=expected_prev,
-            corrupted_entry_id=None,
-        )
+        """Verify every link (legacy v1 and full-payload v2) of the ledger."""
+        return self.ledger.verify()
 
     def close(self) -> None:
-        """Flush SQLite connection on graceful shutdown."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.commit()
+        """Graceful shutdown hook (connections are per-operation)."""
 
     def reset(self) -> None:
         """Clear audit ledger table for deterministic test isolation."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM audit_ledger")
-            conn.commit()
+        self.ledger.reset()

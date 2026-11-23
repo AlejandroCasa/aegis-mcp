@@ -3,6 +3,13 @@
 import re
 from typing import Any
 
+from app.normalize import (
+    ENCODED_TOKEN_PATTERN,
+    canonicalize_text,
+    decode_token,
+    detection_views,
+)
+
 SECRET_PATTERN = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{16,}|"
     r"AKIA[0-9A-Z]{16}|Bearer\s+[A-Za-z0-9._\-]{12,})"
@@ -12,6 +19,40 @@ IBAN_PATTERN = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")
 
 
 def redact_text(value: str) -> tuple[str, set[str]]:
+    """Scrub secrets, emails, and IBANs, including obfuscated occurrences.
+
+    The raw text is redacted first. If its canonical form (Unicode folding
+    plus percent/HTML decoding, ``app/normalize.py``) reveals further
+    sensitive data, the redacted canonical form replaces the value. Base64 /
+    hex tokens that decode to sensitive text become ``[REDACTED_ENCODED]``.
+    """
+    result, categories = _redact_plain(value)
+    canonical = canonicalize_text(result)
+    if canonical != result:
+        revealed, hidden = _redact_plain(canonical)
+        if hidden:
+            result, categories = revealed, categories | hidden
+    encoded: set[str] = set()
+
+    def _scrub_token(match: re.Match[str]) -> str:
+        decoded = decode_token(match.group())
+        found = _sensitive_categories(decoded) if decoded else set()
+        encoded.update(found)
+        return "[REDACTED_ENCODED]" if found else match.group()
+
+    result = ENCODED_TOKEN_PATTERN.sub(_scrub_token, result)
+    return result, categories | encoded
+
+
+def _sensitive_categories(text: str) -> set[str]:
+    """Return DLP categories present in any detection view of ``text``."""
+    found: set[str] = set()
+    for view in detection_views(text).views:
+        found.update(_redact_plain(view)[1])
+    return found
+
+
+def _redact_plain(value: str) -> tuple[str, set[str]]:
     """Scrub secrets, emails, and IBANs from a string and return detected categories."""
     categories: set[str] = set()
     result = value

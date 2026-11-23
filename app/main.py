@@ -4,6 +4,7 @@ import logging
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import (
     Depends,
@@ -15,30 +16,42 @@ from fastapi import (
     Security,
     status,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from starlette.concurrency import run_in_threadpool
 
+from app.auth import (
+    WELL_KNOWN_PATH,
+    AuthError,
+    AuthUnavailableError,
+    Principal,
+    build_resource_server,
+)
 from app.config import settings
 from app.firewall import MCPFirewall
 from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
 from app.metrics import metrics_registry
-from app.policy import PolicyEngine
+from app.policy import build_policy_engine
 from app.schemas import (
     AuditEntry,
     ChainVerificationResponse,
     MCPInspectionResponse,
     MCPToolCallRequest,
     PolicyDocument,
+    PolicyStatus,
+    ToolApproval,
+    ToolPin,
 )
+from app.streamable import StreamableHttpTransport, TransportReply
+from app.toolguard import FingerprintMismatchError, PinNotFoundError
 
 logger = logging.getLogger("aegis_mcp.policy")
 
-policy_engine = PolicyEngine.from_path(settings.policy_path)
-if settings.policy_path is None:
-    logger.warning("AEGIS_POLICY_PATH is not set: RBAC matrix defaults to allow-all.")
+policy_engine = build_policy_engine(settings.policy_path, settings.environment)
 firewall = MCPFirewall(policy_engine=policy_engine)
 jsonrpc_gateway = JsonRpcGateway(firewall=firewall)
+mcp_transport = StreamableHttpTransport(jsonrpc_gateway)
+resource_server = build_resource_server(settings.auth_mode, settings.oauth_config)
 
 
 @asynccontextmanager
@@ -70,6 +83,38 @@ def verify_api_key(api_key: str | None = Security(api_key_header)) -> str | None
             detail="Invalid or missing X-API-Key authentication header.",
         )
     return api_key
+
+
+def authenticate(
+    api_key: str | None = Security(api_key_header),
+    authorization: str | None = Header(default=None),
+) -> Principal | None:
+    """Authenticate a data-plane caller according to ``AEGIS_AUTH_MODE``.
+
+    ``api_key`` mode keeps the local-development X-API-Key check and returns
+    ``None`` (identity is self-declared). ``oauth`` mode requires a valid
+    Bearer JWT and returns the claims-derived Principal; failures yield ``401``
+    with an RFC 6750 / RFC 9728 ``WWW-Authenticate`` challenge.
+    """
+    if not resource_server.enabled:
+        verify_api_key(api_key)
+        return None
+    try:
+        return resource_server.authenticate(authorization)
+    except AuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=exc.description,
+            headers={"WWW-Authenticate": resource_server.challenge(exc)},
+        ) from exc
+    except AuthUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authorization server signing keys are unavailable.",
+        ) from exc
+
+
+AuthenticatedPrincipal = Annotated[Principal | None, Depends(authenticate)]
 
 
 def require_admin_api_key(
@@ -120,20 +165,37 @@ def get_metrics() -> Response:
     )
 
 
+@app.get(WELL_KNOWN_PATH, tags=["OAuth"])
+@app.get(WELL_KNOWN_PATH + "/{resource_path:path}", tags=["OAuth"])
+def protected_resource_metadata(request: Request) -> JSONResponse:
+    """Serve RFC 9728 OAuth 2.0 Protected Resource Metadata (OAuth mode only)."""
+    if not resource_server.serves_metadata_path(request.url.path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return JSONResponse(
+        resource_server.metadata(),
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.post(
     "/api/v1/mcp/inspect",
     response_model=MCPInspectionResponse,
-    dependencies=[Depends(verify_api_key)],
     tags=["MCP Firewall"],
 )
-def inspect_mcp_tool_call(request: MCPToolCallRequest) -> MCPInspectionResponse:
+def inspect_mcp_tool_call(
+    request: MCPToolCallRequest,
+    principal: AuthenticatedPrincipal,
+) -> MCPInspectionResponse:
     """Inspect an MCP tool call, redact sensitive fields, and record in hash chain."""
+    if principal is not None:
+        request = request.model_copy(update={"agent_id": principal.agent_id})
     report = firewall.inspect(request)
     metrics_registry.record_inspection(
         server_name=request.server_name,
         decision=report.decision,
         violations=report.violations,
         redacted_categories=report.redacted_categories,
+        would_block=report.would_block,
     )
     return report
 
@@ -141,7 +203,7 @@ def inspect_mcp_tool_call(request: MCPToolCallRequest) -> MCPInspectionResponse:
 @app.get(
     "/api/v1/audit",
     response_model=list[AuditEntry],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(authenticate)],
     tags=["Audit Ledger"],
 )
 def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
@@ -152,7 +214,7 @@ def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
 @app.get(
     "/api/v1/audit/verify",
     response_model=ChainVerificationResponse,
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(authenticate)],
     tags=["Audit Ledger"],
 )
 def verify_audit_chain() -> ChainVerificationResponse:
@@ -181,11 +243,71 @@ def replace_policies(document: PolicyDocument) -> PolicyDocument:
     """Atomically replace the active RBAC policy matrix."""
     policy_engine.load(document)
     logger.warning(
-        "RBAC policy matrix replaced: default_action=%s rules=%d",
+        "RBAC policy matrix replaced: default_action=%s rules=%d version=%s",
         document.default_action,
         len(document.rules),
+        policy_engine.version,
     )
     return policy_engine.document
+
+
+@app.get(
+    "/api/v1/policies/status",
+    response_model=PolicyStatus,
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["RBAC Policy"],
+)
+def get_policy_status() -> PolicyStatus:
+    """Return the active policy version, mode, and fail-closed state."""
+    _, version, fail_closed = policy_engine.snapshot()
+    return PolicyStatus(
+        policy_version=version,
+        policy_mode=settings.policy_mode,
+        environment=settings.environment,
+        fail_closed=fail_closed,
+    )
+
+
+@app.get(
+    "/api/v1/toolguard/pins",
+    response_model=list[ToolPin],
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["Toolguard"],
+)
+def list_tool_pins(server_name: str | None = None) -> list[ToolPin]:
+    """Return pinned MCP definition fingerprints (pending/approved/drifted)."""
+    return jsonrpc_gateway.toolguard.list_pins(server_name)
+
+
+@app.post(
+    "/api/v1/toolguard/approve",
+    response_model=ToolPin,
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["Toolguard"],
+)
+def approve_tool_pin(approval: ToolApproval) -> ToolPin:
+    """Approve the pinned or drifted fingerprint of an MCP definition."""
+    try:
+        pin = jsonrpc_gateway.toolguard.approve(
+            approval.server_name, approval.kind, approval.name, approval.fingerprint
+        )
+    except PinNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Definition is not pinned."
+        ) from exc
+    except FingerprintMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Fingerprint matches neither the pinned nor the drifted definition.",
+        ) from exc
+    logger.warning(
+        "Toolguard approval: server=%s kind=%s name=%s fingerprint=%s",
+        pin.server_name,
+        pin.kind,
+        pin.name,
+        pin.fingerprint,
+    )
+    return pin
 
 
 async def read_body_capped(request: Request, limit: int) -> bytes:
@@ -200,22 +322,86 @@ async def read_body_capped(request: Request, limit: int) -> bytes:
 
 @app.post(
     "/api/v1/mcp/jsonrpc",
-    dependencies=[Depends(verify_api_key)],
     tags=["MCP Firewall"],
     response_class=JSONResponse,
 )
 async def mcp_jsonrpc_proxy(
     request: Request,
+    principal: AuthenticatedPrincipal,
     x_aegis_agent_id: str | None = Header(default=None),
     x_aegis_mcp_server: str | None = Header(default=None),
     x_aegis_environment: str | None = Header(default=None),
 ) -> JSONResponse:
-    """Firewall, audit, and proxy a JSON-RPC 2.0 MCP request to its upstream."""
+    """Firewall, audit, and proxy a JSON-RPC 2.0 MCP request to its upstream.
+
+    In OAuth mode the agent identity comes only from the validated token; a
+    self-declared ``X-Aegis-Agent-Id`` header is ignored.
+    """
     raw = await read_body_capped(request, MAX_REQUEST_BYTES)
     routing = {
-        "agent_id": x_aegis_agent_id,
+        "agent_id": principal.agent_id if principal else x_aegis_agent_id,
         "server_name": x_aegis_mcp_server,
         "environment": x_aegis_environment,
     }
     payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
     return JSONResponse(payload)
+
+
+def mcp_routing(principal: Principal | None, request: Request) -> dict[str, str | None]:
+    """Caller routing for ``/mcp``: identity is token-derived in OAuth mode."""
+    headers = request.headers
+    return {
+        "agent_id": (
+            principal.agent_id if principal else headers.get("x-aegis-agent-id")
+        ),
+        "server_name": headers.get("x-aegis-mcp-server"),
+        "environment": headers.get("x-aegis-environment"),
+    }
+
+
+def transport_response(reply: TransportReply) -> Response:
+    """Render a transport reply as JSON, an SSE stream, or an empty body."""
+    if reply.stream is not None:
+        return StreamingResponse(
+            reply.stream,
+            status_code=reply.status,
+            media_type="text/event-stream",
+            headers={**reply.headers, "Cache-Control": "no-cache"},
+        )
+    if reply.body is None:
+        return Response(status_code=reply.status, headers=reply.headers)
+    return JSONResponse(reply.body, status_code=reply.status, headers=reply.headers)
+
+
+@app.post("/mcp", tags=["MCP Streamable HTTP"], response_class=Response)
+async def mcp_streamable_post(
+    request: Request, principal: AuthenticatedPrincipal
+) -> Response:
+    """MCP Streamable HTTP: send JSON-RPC messages (JSON or SSE replies)."""
+    raw = await read_body_capped(request, MAX_REQUEST_BYTES)
+    reply = await run_in_threadpool(
+        mcp_transport.post, request.headers, raw, mcp_routing(principal, request)
+    )
+    return transport_response(reply)
+
+
+@app.get("/mcp", tags=["MCP Streamable HTTP"], response_class=Response)
+async def mcp_streamable_get(
+    request: Request, principal: AuthenticatedPrincipal
+) -> Response:
+    """MCP Streamable HTTP: open the server-initiated SSE stream."""
+    reply = await run_in_threadpool(
+        mcp_transport.get, request.headers, mcp_routing(principal, request)
+    )
+    return transport_response(reply)
+
+
+@app.delete("/mcp", tags=["MCP Streamable HTTP"], response_class=Response)
+async def mcp_streamable_delete(
+    request: Request, principal: AuthenticatedPrincipal
+) -> Response:
+    """MCP Streamable HTTP: terminate the session."""
+    reply = await run_in_threadpool(
+        mcp_transport.delete, request.headers, mcp_routing(principal, request)
+    )
+    return transport_response(reply)

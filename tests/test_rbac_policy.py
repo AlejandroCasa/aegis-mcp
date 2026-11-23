@@ -306,7 +306,11 @@ def test_get_policies_returns_active_matrix() -> None:
     settings.api_key = ADMIN_KEY
     res = client.get("/api/v1/policies", headers={"X-API-Key": ADMIN_KEY})
     assert res.status_code == 200
-    assert res.json() == {"default_action": "allow", "rules": []}
+    assert res.json() == {
+        "default_action": "allow",
+        "rules": [],
+        "tool_constraints": [],
+    }
 
 
 def test_get_policies_requires_admin_key() -> None:
