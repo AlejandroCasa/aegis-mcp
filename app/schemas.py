@@ -306,6 +306,35 @@ class ToolConstraint(BaseModel):
         return self
 
 
+PinKindName = Literal["server", "tool", "resource", "prompt"]
+
+
+class ToolPin(BaseModel):
+    """A pinned MCP definition fingerprint (TOFU + explicit approval)."""
+
+    server_name: str = Field(..., description="Upstream MCP server name.")
+    kind: PinKindName = Field(..., description="Definition kind.")
+    name: str = Field(..., description="Tool/prompt name or resource URI.")
+    fingerprint: str = Field(..., description="Pinned SHA-256 (RFC 8785 JCS).")
+    status: Literal["pending", "approved"] = Field(..., description="Approval.")
+    drift_fingerprint: str | None = Field(
+        default=None, description="Latest differing fingerprint (sticky drift)."
+    )
+    first_seen: str = Field(..., description="ISO-8601 UTC first observation.")
+    updated_at: str = Field(..., description="ISO-8601 UTC last change.")
+
+
+class ToolApproval(BaseModel):
+    """Operator approval of a pinned or drifted definition fingerprint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_name: str = Field(..., min_length=1, max_length=256)
+    kind: PinKindName = Field(default="tool")
+    name: str = Field(..., min_length=1, max_length=1024)
+    fingerprint: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
 class PolicyStatus(BaseModel):
     """Operational state of the active policy (version, mode, fail-closed)."""
 

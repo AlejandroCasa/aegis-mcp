@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     # ``enforce`` blocks; ``monitor`` (shadow mode) evaluates and audits
     # ``would_block`` without blocking, for progressive production rollouts.
     policy_mode: PolicyMode = "enforce"
+    # Tool manifest pinning: require operator approval before pinned (TOFU)
+    # tools/prompts may be called. Drifted definitions are always blocked.
+    toolguard_require_approval: bool = False
     mcp_upstreams: dict[str, str] = Field(default_factory=dict)
     upstream_timeout_seconds: float = 10.0
 

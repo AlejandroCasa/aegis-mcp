@@ -39,7 +39,10 @@ from app.schemas import (
     MCPToolCallRequest,
     PolicyDocument,
     PolicyStatus,
+    ToolApproval,
+    ToolPin,
 )
+from app.toolguard import FingerprintMismatchError, PinNotFoundError
 
 logger = logging.getLogger("aegis_mcp.policy")
 
@@ -261,6 +264,48 @@ def get_policy_status() -> PolicyStatus:
         environment=settings.environment,
         fail_closed=fail_closed,
     )
+
+
+@app.get(
+    "/api/v1/toolguard/pins",
+    response_model=list[ToolPin],
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["Toolguard"],
+)
+def list_tool_pins(server_name: str | None = None) -> list[ToolPin]:
+    """Return pinned MCP definition fingerprints (pending/approved/drifted)."""
+    return jsonrpc_gateway.toolguard.list_pins(server_name)
+
+
+@app.post(
+    "/api/v1/toolguard/approve",
+    response_model=ToolPin,
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["Toolguard"],
+)
+def approve_tool_pin(approval: ToolApproval) -> ToolPin:
+    """Approve the pinned or drifted fingerprint of an MCP definition."""
+    try:
+        pin = jsonrpc_gateway.toolguard.approve(
+            approval.server_name, approval.kind, approval.name, approval.fingerprint
+        )
+    except PinNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Definition is not pinned."
+        ) from exc
+    except FingerprintMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Fingerprint matches neither the pinned nor the drifted definition.",
+        ) from exc
+    logger.warning(
+        "Toolguard approval: server=%s kind=%s name=%s fingerprint=%s",
+        pin.server_name,
+        pin.kind,
+        pin.name,
+        pin.fingerprint,
+    )
+    return pin
 
 
 async def read_body_capped(request: Request, limit: int) -> bytes:

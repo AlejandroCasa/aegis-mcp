@@ -16,6 +16,14 @@ Request pipeline for ``POST /api/v1/mcp/jsonrpc``:
 
 RBAC ``tool_name`` mapping: ``tools/call`` uses ``params.name``; the other
 methods use the method name itself (``resources/read``, ``prompts/get``).
+
+Discovery methods (``initialize``, ``ping``, ``tools/list``,
+``resources/list``, ``resources/templates/list``, ``prompts/list``) are
+forwarded with DLP-redacted params; their results pass through the toolguard
+(``app/toolguard.py``): every definition is fingerprinted and pinned (TOFU),
+drifted definitions are filtered and audited as ``tool_definition_drift``, and
+``tools/list`` only advertises tools the RBAC matrix authorizes for the agent
+(least-privilege discovery). Any other method is rejected (``-32601``).
 """
 
 import json
@@ -33,6 +41,13 @@ from app.firewall import MCPFirewall
 from app.metrics import metrics_registry
 from app.redactor import redact_payload, redact_text
 from app.schemas import Environment, MCPInspectionResponse, MCPToolCallRequest
+from app.toolguard import (
+    DRIFT_VIOLATION,
+    LIST_METHODS,
+    TOOLGUARD_RISK_SCORE,
+    PinKind,
+    ToolGuard,
+)
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -215,15 +230,46 @@ METHOD_HANDLERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "prompts/get": _prompts_get,
 }
 
+CALL_KINDS: dict[str, PinKind] = {
+    "tools/call": "tool",
+    "resources/read": "resource",
+    "prompts/get": "prompt",
+}
 
-def resolve_call(envelope: Envelope) -> tuple[str, dict[str, Any]]:
-    """Return the RBAC tool name and params dict for a supported MCP method."""
+DISCOVERY_METHODS = frozenset(
+    {
+        "initialize",
+        "ping",
+        "tools/list",
+        "resources/list",
+        "resources/templates/list",
+        "prompts/list",
+    }
+)
+
+
+def resolve_call(envelope: Envelope) -> tuple[str | None, dict[str, Any]]:
+    """Return the RBAC tool name (None for discovery) and the params dict."""
     handler = METHOD_HANDLERS.get(envelope.method)
-    if handler is None:
+    if handler is None and envelope.method not in DISCOVERY_METHODS:
         raise JsonRpcError(METHOD_NOT_FOUND, "Method not found.")
     if not isinstance(envelope.params, dict):
         raise JsonRpcError(INVALID_PARAMS, "params must be an object.")
-    return handler(envelope.params), envelope.params
+    return (handler(envelope.params) if handler else None), envelope.params
+
+
+def _drift_error(violations: list[str], audit_hash: str) -> JsonRpcError:
+    """Build the -32003 error for a drifted server definition."""
+    return JsonRpcError(
+        POLICY_BLOCKED,
+        "Request blocked by Aegis-MCP security policy.",
+        data={
+            "decision": "BLOCKED",
+            "risk_score": TOOLGUARD_RISK_SCORE,
+            "violations": violations,
+            "audit_hash": audit_hash,
+        },
+    )
 
 
 def redact_value(value: Any) -> Any:
@@ -296,13 +342,17 @@ class JsonRpcGateway:
         firewall: MCPFirewall,
         upstreams: Mapping[str, str] | None = None,
         client: httpx.Client | None = None,
+        toolguard: ToolGuard | None = None,
     ) -> None:
-        """Bind the firewall, validated upstream map, and HTTP client."""
+        """Bind the firewall, upstream map, HTTP client, and pin store."""
         self.firewall = firewall
         self.upstreams = validate_upstreams(
             settings.mcp_upstreams if upstreams is None else upstreams
         )
         self.client = client or build_default_client()
+        self.toolguard = toolguard or ToolGuard(
+            firewall.db_path, require_approval=settings.toolguard_require_approval
+        )
 
     def set_upstreams(self, upstreams: Mapping[str, str]) -> None:
         """Atomically replace the validated server-name to URL mapping."""
@@ -331,17 +381,30 @@ class JsonRpcGateway:
         self,
         envelope: Envelope,
         context: CallContext,
-        tool_name: str,
+        tool_name: str | None,
         params: dict[str, Any],
     ) -> dict[str, Any]:
         """Inspect, forward, and redact a validated MCP call."""
         url = self._upstream_url(context)
-        report = self._inspect(context, tool_name, params)
-        upstream = self._forward(url, envelope, dict(report.sanitized_arguments))
+        outbound = self.prepare(envelope, context, tool_name, params)
+        upstream = self._forward(url, envelope, outbound)
         try:
-            return self._relay(envelope.req_id, upstream)
+            return self.relay(envelope, context, upstream)
         except RecursionError as exc:
             raise _upstream_failure() from exc
+
+    def prepare(
+        self,
+        envelope: Envelope,
+        context: CallContext,
+        tool_name: str | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the outbound params: inspected calls or redacted discovery."""
+        if tool_name is None:
+            return dict(redact_value(params))
+        report = self._inspect(context, envelope.method, tool_name, params)
+        return dict(report.sanitized_arguments)
 
     def _upstream_url(self, context: CallContext) -> str:
         """Resolve the configured upstream before any inspection or auditing."""
@@ -352,10 +415,24 @@ class JsonRpcGateway:
             )
         return url
 
+    def _call_denials(
+        self, context: CallContext, method: str, params: dict[str, Any]
+    ) -> list[str]:
+        """Return toolguard violations (drift / unapproved) for a call."""
+        kind = CALL_KINDS[method]
+        key = params.get("uri" if kind == "resource" else "name")
+        if not isinstance(key, str):
+            return []
+        return self.toolguard.call_violations(context.server_name, kind, key)
+
     def _inspect(
-        self, context: CallContext, tool_name: str, params: dict[str, Any]
+        self,
+        context: CallContext,
+        method: str,
+        tool_name: str,
+        params: dict[str, Any],
     ) -> MCPInspectionResponse:
-        """Run threat rules, RBAC, argument ABAC, inbound DLP, and the ledger.
+        """Run threat rules, RBAC, ABAC, toolguard, inbound DLP, and the ledger.
 
         Argument constraints see the tool/prompt ``params.arguments`` object
         (``resources/read`` exposes ``params`` itself, i.e. its ``uri``).
@@ -370,6 +447,7 @@ class JsonRpcGateway:
                 environment=context.environment,
             ),
             constraint_arguments=nested if isinstance(nested, dict) else params,
+            denials=self._call_denials(context, method, params),
         )
         metrics_registry.record_inspection(
             server_name=context.server_name,
@@ -390,6 +468,80 @@ class JsonRpcGateway:
                 },
             )
         return report
+
+    def _audit_violation(
+        self, context: CallContext, subject: str, violations: list[str]
+    ) -> tuple[bool, str]:
+        """Ledger a discovery-time violation; return ``(blocking, audit_hash)``."""
+        decision, audit_hash = self.firewall.record_event(
+            (context.agent_id, context.server_name, subject, context.environment),
+            violations,
+        )
+        metrics_registry.record_inspection(
+            server_name=context.server_name,
+            decision=decision,
+            violations=violations,
+            redacted_categories=[],
+            would_block=True,
+        )
+        return decision == "BLOCKED", audit_hash
+
+    def screen_result(self, method: str, context: CallContext, result: Any) -> Any:
+        """Apply toolguard screening to discovery results (others unchanged)."""
+        if not isinstance(result, dict):
+            return result
+        if method == "initialize":
+            self._screen_initialize(context, result)
+        elif method in LIST_METHODS:
+            return self._screen_listing(method, context, result)
+        return result
+
+    def _screen_initialize(self, context: CallContext, result: dict[str, Any]) -> None:
+        """Pin the server identity + ``instructions``; block on drift."""
+        info = result.get("serverInfo")
+        definition = {
+            "name": "initialize",
+            "serverName": info.get("name") if isinstance(info, dict) else None,
+            "instructions": result.get("instructions"),
+        }
+        observation = self.toolguard.observe(context.server_name, "server", definition)
+        if observation is not None and observation.verdict == "drifted":
+            blocking, audit_hash = self._audit_violation(
+                context, "server:initialize", [DRIFT_VIOLATION]
+            )
+            if blocking:
+                raise _drift_error([DRIFT_VIOLATION], audit_hash)
+
+    def _screen_listing(
+        self, method: str, context: CallContext, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Filter a ``*/list`` page to pinned, non-drifted, authorized items."""
+        kind, field = LIST_METHODS[method]
+        items = result.get(field)
+        if not isinstance(items, list):
+            return result
+        kept = [item for item in items if self._admit(context, kind, item)]
+        return {**result, field: kept}
+
+    def _admit(self, context: CallContext, kind: PinKind, item: Any) -> bool:
+        """Return True if a listed definition may be advertised to the agent."""
+        observation = self.toolguard.observe(context.server_name, kind, item)
+        if observation is None:
+            return False
+        if observation.verdict == "drifted":
+            blocking, _ = self._audit_violation(
+                context, f"{kind}:{observation.name}", [DRIFT_VIOLATION]
+            )
+            return not blocking
+        if settings.policy_mode == "monitor":
+            return True
+        if self.toolguard.needs_approval(kind, observation.verdict):
+            return False
+        if kind != "tool":
+            return True
+        return self.firewall.policy_engine.is_allowed(
+            context.agent_id, context.server_name, observation.name, context.environment
+        )
 
     def _forward(
         self, url: str, envelope: Envelope, params: dict[str, Any]
@@ -419,10 +571,14 @@ class JsonRpcGateway:
             raise _upstream_failure()
         return payload
 
-    def _relay(self, req_id: str | int, upstream: dict[str, Any]) -> dict[str, Any]:
-        """Redact the upstream result/error and bind it to the caller's id."""
+    def relay(
+        self, envelope: Envelope, context: CallContext, upstream: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Screen + redact the upstream result/error, bound to the caller's id."""
+        req_id = envelope.req_id
         if "result" in upstream:
-            return success_response(req_id, redact_value(upstream["result"]))
+            result = self.screen_result(envelope.method, context, upstream["result"])
+            return success_response(req_id, redact_value(result))
         error = upstream.get("error")
         if _is_error_object(error):
             return error_response(req_id, _neutralize_error(redact_value(error)))
