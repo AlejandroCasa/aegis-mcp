@@ -34,8 +34,24 @@ class Settings(BaseSettings):
     # Tool manifest pinning: require operator approval before pinned (TOFU)
     # tools/prompts may be called. Drifted definitions are always blocked.
     toolguard_require_approval: bool = False
+    # Tool poisoning / cross-server shadowing scan of discovered definitions:
+    # findings scoring >= block_threshold_score hide the definition (and strip
+    # poisoned ``instructions``) and block calls in enforce mode.
+    toolguard_scan_poisoning: bool = True
     mcp_upstreams: dict[str, str] = Field(default_factory=dict)
     upstream_timeout_seconds: float = 10.0
+
+    # Native MCP Streamable HTTP transport (``/mcp``): browser ``Origin``
+    # allowlist (DNS-rebinding defense; requests without Origin are allowed),
+    # session lifetime/capacity, and the wall-clock cap of one SSE stream.
+    mcp_allowed_origins: list[str] = Field(default_factory=list)
+    mcp_session_ttl_seconds: int = 3600
+    mcp_max_sessions: int = 10_000
+    mcp_stream_timeout_seconds: float = 300.0
+
+    # Audit ledger: SQLite write-ahead logging (concurrent readers never
+    # block the single chain writer).
+    ledger_wal: bool = True
 
     # Authentication: ``api_key`` (local development, X-API-Key + self-declared
     # X-Aegis-Agent-Id) or ``oauth`` (OAuth 2.1 resource server, identity from

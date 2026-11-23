@@ -240,6 +240,33 @@ class ToolGuard:
             row = cursor.fetchone()
         return None if row is None else _row_to_pin(row)
 
+    def get_definition(
+        self, server_name: str, kind: PinKind, name: str
+    ) -> dict[str, Any] | None:
+        """Return the pinned definition (drifted one if drift is pending)."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT COALESCE(drift_json, definition_json) FROM toolguard_pins "
+                "WHERE server_name = ? AND kind = ? AND name = ?",
+                (server_name, kind, name),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        definition = json.loads(str(row[0]))
+        return definition if isinstance(definition, dict) else None
+
+    def foreign_tool_names(self, server_name: str) -> frozenset[str]:
+        """Return tool names pinned for every *other* server (shadowing scope)."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT name FROM toolguard_pins "
+                "WHERE kind = 'tool' AND server_name != ?",
+                (server_name,),
+            )
+            rows = cursor.fetchall()
+        return frozenset(str(row[0]) for row in rows)
+
     def list_pins(self, server_name: str | None = None) -> list[ToolPin]:
         """Return every pin, optionally for one server, in stable order."""
         query = f"SELECT {_PIN_COLUMNS} FROM toolguard_pins"  # nosec B608

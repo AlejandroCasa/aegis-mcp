@@ -39,6 +39,7 @@ from app.auth import strip_credentials
 from app.config import settings
 from app.firewall import MCPFirewall
 from app.metrics import metrics_registry
+from app.poisoning import POISONING_VIOLATION, blocking_rules
 from app.redactor import redact_payload, redact_text
 from app.schemas import Environment, MCPInspectionResponse, MCPToolCallRequest
 from app.toolguard import (
@@ -98,6 +99,7 @@ class CallContext:
     agent_id: str
     server_name: str
     environment: Environment
+    session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -119,7 +121,7 @@ def success_response(req_id: RequestId, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
-def _upstream_failure() -> JsonRpcError:
+def upstream_failure() -> JsonRpcError:
     """Return a generic upstream error that never leaks transport details."""
     return JsonRpcError(UPSTREAM_ERROR, "Upstream MCP server error.")
 
@@ -281,7 +283,7 @@ def redact_value(value: Any) -> Any:
     return sanitized["value"]
 
 
-def _reject_constant(token: str) -> Any:
+def reject_constant(token: str) -> Any:
     """Reject non-standard JSON constants (NaN, Infinity) from upstreams."""
     raise ValueError(f"Non-standard JSON constant: {token}")
 
@@ -305,13 +307,13 @@ def validate_upstreams(upstreams: Mapping[str, str]) -> dict[str, str]:
     return dict(upstreams)
 
 
-def _read_capped(response: httpx.Response, deadline: float) -> bytes:
+def read_capped(response: httpx.Response, deadline: float) -> bytes:
     """Stream an upstream body within the size cap and wall-clock deadline."""
     buffer = bytearray()
     for chunk in response.iter_bytes():
         buffer.extend(chunk)
         if len(buffer) > MAX_UPSTREAM_BYTES or time.monotonic() > deadline:
-            raise _upstream_failure()
+            raise upstream_failure()
     return bytes(buffer)
 
 
@@ -385,13 +387,13 @@ class JsonRpcGateway:
         params: dict[str, Any],
     ) -> dict[str, Any]:
         """Inspect, forward, and redact a validated MCP call."""
-        url = self._upstream_url(context)
+        url = self.upstream_url(context)
         outbound = self.prepare(envelope, context, tool_name, params)
         upstream = self._forward(url, envelope, outbound)
         try:
             return self.relay(envelope, context, upstream)
         except RecursionError as exc:
-            raise _upstream_failure() from exc
+            raise upstream_failure() from exc
 
     def prepare(
         self,
@@ -406,7 +408,7 @@ class JsonRpcGateway:
         report = self._inspect(context, envelope.method, tool_name, params)
         return dict(report.sanitized_arguments)
 
-    def _upstream_url(self, context: CallContext) -> str:
+    def upstream_url(self, context: CallContext) -> str:
         """Resolve the configured upstream before any inspection or auditing."""
         url = self.upstreams.get(context.server_name)
         if url is None:
@@ -418,12 +420,48 @@ class JsonRpcGateway:
     def _call_denials(
         self, context: CallContext, method: str, params: dict[str, Any]
     ) -> list[str]:
-        """Return toolguard violations (drift / unapproved) for a call."""
+        """Return toolguard violations (drift / unapproved / poisoned)."""
         kind = CALL_KINDS[method]
         key = params.get("uri" if kind == "resource" else "name")
         if not isinstance(key, str):
             return []
-        return self.toolguard.call_violations(context.server_name, kind, key)
+        violations = self.toolguard.call_violations(context.server_name, kind, key)
+        if violations or not settings.toolguard_scan_poisoning:
+            return violations
+        definition = self.toolguard.get_definition(context.server_name, kind, key)
+        rules = self._poison_rules(context, kind, definition)
+        return [POISONING_VIOLATION, *rules] if rules else []
+
+    def _poison_rules(
+        self,
+        context: CallContext,
+        kind: PinKind,
+        definition: Any,
+        foreign: frozenset[str] | None = None,
+    ) -> list[str]:
+        """Return blocking poisoning/shadowing rules for one definition."""
+        if not settings.toolguard_scan_poisoning:
+            return []
+        if foreign is None:
+            foreign = self.toolguard.foreign_tool_names(context.server_name)
+        return blocking_rules(kind, definition, foreign, settings.block_threshold_score)
+
+    def _poisoned(
+        self,
+        context: CallContext,
+        observation_name: str,
+        kind: PinKind,
+        definition: Any,
+        foreign: frozenset[str],
+    ) -> bool:
+        """Audit a poisoned definition; True if it must be hidden (enforce)."""
+        rules = self._poison_rules(context, kind, definition, foreign)
+        if not rules:
+            return False
+        blocking, _ = self._audit_violation(
+            context, f"{kind}:{observation_name}", [POISONING_VIOLATION, *rules]
+        )
+        return blocking
 
     def _inspect(
         self,
@@ -448,6 +486,7 @@ class JsonRpcGateway:
             ),
             constraint_arguments=nested if isinstance(nested, dict) else params,
             denials=self._call_denials(context, method, params),
+            session_id=context.session_id,
         )
         metrics_registry.record_inspection(
             server_name=context.server_name,
@@ -476,6 +515,7 @@ class JsonRpcGateway:
         decision, audit_hash = self.firewall.record_event(
             (context.agent_id, context.server_name, subject, context.environment),
             violations,
+            session_id=context.session_id,
         )
         metrics_registry.record_inspection(
             server_name=context.server_name,
@@ -491,13 +531,19 @@ class JsonRpcGateway:
         if not isinstance(result, dict):
             return result
         if method == "initialize":
-            self._screen_initialize(context, result)
-        elif method in LIST_METHODS:
+            return self._screen_initialize(context, result)
+        if method in LIST_METHODS:
             return self._screen_listing(method, context, result)
         return result
 
-    def _screen_initialize(self, context: CallContext, result: dict[str, Any]) -> None:
-        """Pin the server identity + ``instructions``; block on drift."""
+    def _screen_initialize(
+        self, context: CallContext, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Pin the server identity + ``instructions``; block on drift.
+
+        Poisoned ``instructions`` are audited and, in enforce mode, stripped
+        from the relayed result (the session itself stays usable).
+        """
         info = result.get("serverInfo")
         definition = {
             "name": "initialize",
@@ -511,6 +557,11 @@ class JsonRpcGateway:
             )
             if blocking:
                 raise _drift_error([DRIFT_VIOLATION], audit_hash)
+        if self._poisoned(context, "initialize", "server", definition, frozenset()):
+            return {
+                key: value for key, value in result.items() if key != "instructions"
+            }
+        return result
 
     def _screen_listing(
         self, method: str, context: CallContext, result: dict[str, Any]
@@ -520,10 +571,21 @@ class JsonRpcGateway:
         items = result.get(field)
         if not isinstance(items, list):
             return result
-        kept = [item for item in items if self._admit(context, kind, item)]
+        foreign = (
+            self.toolguard.foreign_tool_names(context.server_name)
+            if settings.toolguard_scan_poisoning
+            else frozenset()
+        )
+        kept = [item for item in items if self._admit(context, kind, item, foreign)]
         return {**result, field: kept}
 
-    def _admit(self, context: CallContext, kind: PinKind, item: Any) -> bool:
+    def _admit(
+        self,
+        context: CallContext,
+        kind: PinKind,
+        item: Any,
+        foreign: frozenset[str] = frozenset(),
+    ) -> bool:
         """Return True if a listed definition may be advertised to the agent."""
         observation = self.toolguard.observe(context.server_name, kind, item)
         if observation is None:
@@ -533,6 +595,8 @@ class JsonRpcGateway:
                 context, f"{kind}:{observation.name}", [DRIFT_VIOLATION]
             )
             return not blocking
+        if self._poisoned(context, observation.name, kind, item, foreign):
+            return False
         if settings.policy_mode == "monitor":
             return True
         if self.toolguard.needs_approval(kind, observation.verdict):
@@ -560,15 +624,15 @@ class JsonRpcGateway:
             response = self.client.send(request, stream=True)
             try:
                 if response.status_code != httpx.codes.OK:
-                    raise _upstream_failure()
-                body = _read_capped(response, deadline)
+                    raise upstream_failure()
+                body = read_capped(response, deadline)
             finally:
                 response.close()
-            payload = json.loads(body, parse_constant=_reject_constant)
+            payload = json.loads(body, parse_constant=reject_constant)
         except (httpx.HTTPError, ValueError, RecursionError) as exc:
-            raise _upstream_failure() from exc
+            raise upstream_failure() from exc
         if not isinstance(payload, dict):
-            raise _upstream_failure()
+            raise upstream_failure()
         return payload
 
     def relay(
@@ -582,4 +646,4 @@ class JsonRpcGateway:
         error = upstream.get("error")
         if _is_error_object(error):
             return error_response(req_id, _neutralize_error(redact_value(error)))
-        raise _upstream_failure()
+        raise upstream_failure()

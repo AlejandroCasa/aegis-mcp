@@ -145,6 +145,15 @@ class AuditEntry(BaseModel):
     policy_version: str = Field(
         default="", description="SHA-256 of the deciding policy document."
     )
+    hash_version: int = Field(
+        default=1, description="Link format: 1 legacy, 2 full-payload JCS."
+    )
+    session_id: str = Field(
+        default="", description="Gateway MCP session (Mcp-Session-Id), if any."
+    )
+    args_digest: str = Field(
+        default="", description="JCS SHA-256 of the sanitized arguments (v2)."
+    )
 
 
 class ChainVerificationResponse(BaseModel):
@@ -166,6 +175,11 @@ class ChainVerificationResponse(BaseModel):
     corrupted_entry_id: int | None = Field(
         default=None,
         description="ID of the first tampered record if integrity verification fails.",
+    )
+    legacy_entries: int = Field(
+        default=0,
+        ge=0,
+        description="Entries still linked with the legacy v1 hash format.",
     )
 
 

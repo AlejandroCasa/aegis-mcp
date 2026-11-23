@@ -16,7 +16,7 @@ from fastapi import (
     Security,
     status,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from starlette.concurrency import run_in_threadpool
 
@@ -42,6 +42,7 @@ from app.schemas import (
     ToolApproval,
     ToolPin,
 )
+from app.streamable import StreamableHttpTransport, TransportReply
 from app.toolguard import FingerprintMismatchError, PinNotFoundError
 
 logger = logging.getLogger("aegis_mcp.policy")
@@ -49,6 +50,7 @@ logger = logging.getLogger("aegis_mcp.policy")
 policy_engine = build_policy_engine(settings.policy_path, settings.environment)
 firewall = MCPFirewall(policy_engine=policy_engine)
 jsonrpc_gateway = JsonRpcGateway(firewall=firewall)
+mcp_transport = StreamableHttpTransport(jsonrpc_gateway)
 resource_server = build_resource_server(settings.auth_mode, settings.oauth_config)
 
 
@@ -343,3 +345,63 @@ async def mcp_jsonrpc_proxy(
     }
     payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
     return JSONResponse(payload)
+
+
+def mcp_routing(principal: Principal | None, request: Request) -> dict[str, str | None]:
+    """Caller routing for ``/mcp``: identity is token-derived in OAuth mode."""
+    headers = request.headers
+    return {
+        "agent_id": (
+            principal.agent_id if principal else headers.get("x-aegis-agent-id")
+        ),
+        "server_name": headers.get("x-aegis-mcp-server"),
+        "environment": headers.get("x-aegis-environment"),
+    }
+
+
+def transport_response(reply: TransportReply) -> Response:
+    """Render a transport reply as JSON, an SSE stream, or an empty body."""
+    if reply.stream is not None:
+        return StreamingResponse(
+            reply.stream,
+            status_code=reply.status,
+            media_type="text/event-stream",
+            headers={**reply.headers, "Cache-Control": "no-cache"},
+        )
+    if reply.body is None:
+        return Response(status_code=reply.status, headers=reply.headers)
+    return JSONResponse(reply.body, status_code=reply.status, headers=reply.headers)
+
+
+@app.post("/mcp", tags=["MCP Streamable HTTP"], response_class=Response)
+async def mcp_streamable_post(
+    request: Request, principal: AuthenticatedPrincipal
+) -> Response:
+    """MCP Streamable HTTP: send JSON-RPC messages (JSON or SSE replies)."""
+    raw = await read_body_capped(request, MAX_REQUEST_BYTES)
+    reply = await run_in_threadpool(
+        mcp_transport.post, request.headers, raw, mcp_routing(principal, request)
+    )
+    return transport_response(reply)
+
+
+@app.get("/mcp", tags=["MCP Streamable HTTP"], response_class=Response)
+async def mcp_streamable_get(
+    request: Request, principal: AuthenticatedPrincipal
+) -> Response:
+    """MCP Streamable HTTP: open the server-initiated SSE stream."""
+    reply = await run_in_threadpool(
+        mcp_transport.get, request.headers, mcp_routing(principal, request)
+    )
+    return transport_response(reply)
+
+
+@app.delete("/mcp", tags=["MCP Streamable HTTP"], response_class=Response)
+async def mcp_streamable_delete(
+    request: Request, principal: AuthenticatedPrincipal
+) -> Response:
+    """MCP Streamable HTTP: terminate the session."""
+    reply = await run_in_threadpool(
+        mcp_transport.delete, request.headers, mcp_routing(principal, request)
+    )
+    return transport_response(reply)
