@@ -31,20 +31,19 @@ from app.config import settings
 from app.firewall import MCPFirewall
 from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
 from app.metrics import metrics_registry
-from app.policy import PolicyEngine
+from app.policy import build_policy_engine
 from app.schemas import (
     AuditEntry,
     ChainVerificationResponse,
     MCPInspectionResponse,
     MCPToolCallRequest,
     PolicyDocument,
+    PolicyStatus,
 )
 
 logger = logging.getLogger("aegis_mcp.policy")
 
-policy_engine = PolicyEngine.from_path(settings.policy_path)
-if settings.policy_path is None:
-    logger.warning("AEGIS_POLICY_PATH is not set: RBAC matrix defaults to allow-all.")
+policy_engine = build_policy_engine(settings.policy_path, settings.environment)
 firewall = MCPFirewall(policy_engine=policy_engine)
 jsonrpc_gateway = JsonRpcGateway(firewall=firewall)
 resource_server = build_resource_server(settings.auth_mode, settings.oauth_config)
@@ -191,6 +190,7 @@ def inspect_mcp_tool_call(
         decision=report.decision,
         violations=report.violations,
         redacted_categories=report.redacted_categories,
+        would_block=report.would_block,
     )
     return report
 
@@ -238,11 +238,29 @@ def replace_policies(document: PolicyDocument) -> PolicyDocument:
     """Atomically replace the active RBAC policy matrix."""
     policy_engine.load(document)
     logger.warning(
-        "RBAC policy matrix replaced: default_action=%s rules=%d",
+        "RBAC policy matrix replaced: default_action=%s rules=%d version=%s",
         document.default_action,
         len(document.rules),
+        policy_engine.version,
     )
     return policy_engine.document
+
+
+@app.get(
+    "/api/v1/policies/status",
+    response_model=PolicyStatus,
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["RBAC Policy"],
+)
+def get_policy_status() -> PolicyStatus:
+    """Return the active policy version, mode, and fail-closed state."""
+    _, version, fail_closed = policy_engine.snapshot()
+    return PolicyStatus(
+        policy_version=version,
+        policy_mode=settings.policy_mode,
+        environment=settings.environment,
+        fail_closed=fail_closed,
+    )
 
 
 async def read_body_capped(request: Request, limit: int) -> bytes:

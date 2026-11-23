@@ -30,6 +30,16 @@ Aegis-MCP sits between AI Agents (Claude Desktop, Cursor, autonomous orchestrato
 
 ---
 
+## ⚙️ Gateway Configuration (`AEGIS_*`)
+
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `AEGIS_ENVIRONMENT` | `dev` | Deployment environment of the gateway. In `prod`, a missing or invalid `AEGIS_POLICY_PATH` **fails closed** (deny-all, violation `policy_fail_closed`) instead of allow-all. |
+| `AEGIS_POLICY_MODE` | `enforce` | `enforce` blocks; `monitor` (shadow mode) evaluates and audits `would_block=true` without blocking, for progressive rollouts (`aegis_mcp_shadow_would_block_total`). |
+| `AEGIS_POLICY_PATH` | unset | YAML RBAC/ABAC policy. Every decision records `policy_version` = SHA-256 of the RFC 8785 (JCS) canonical document (`GET /api/v1/policies/status`). |
+
+---
+
 ## 🚀 Quick Start & Local Simulation
 
 ```bash

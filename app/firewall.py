@@ -4,19 +4,41 @@ import hashlib
 import json
 import re
 import sqlite3
-from typing import Any, Literal
+from typing import Any
 
 from app.config import settings
-from app.policy import RBAC_RISK_SCORE, RBAC_VIOLATION, PolicyEngine
+from app.policy import (
+    FAIL_CLOSED_VIOLATION,
+    RBAC_RISK_SCORE,
+    RBAC_VIOLATION,
+    PolicyEngine,
+    build_policy_engine,
+    evaluate_policy,
+)
 from app.redactor import redact_payload
 from app.schemas import (
     AuditEntry,
     ChainVerificationResponse,
+    Decision,
     MCPInspectionResponse,
     MCPToolCallRequest,
 )
 
 GENESIS_HASH = "0" * 64
+
+# Additive, idempotent schema migrations (column name, DDL type/default).
+LEDGER_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("policy_version", "TEXT NOT NULL DEFAULT ''"),
+    ("policy_mode", "TEXT NOT NULL DEFAULT 'enforce'"),
+    ("would_block", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+LEDGER_SELECT = (
+    "SELECT id, agent_id, server_name, tool_name, environment, "
+    "decision, risk_score, violations_json, redacted_json, "
+    "prev_hash, entry_hash, timestamp, would_block, policy_mode, policy_version "
+    "FROM audit_ledger"
+)
 
 THREAT_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
     (
@@ -96,16 +118,28 @@ class MCPFirewall:
         db_path: str | None = None,
         policy_engine: PolicyEngine | None = None,
     ) -> None:
-        """Initialize SQLite audit ledger and the RBAC policy engine."""
+        """Initialize SQLite audit ledger and the RBAC policy engine.
+
+        Without an explicit engine the startup policy is built fail-closed:
+        ``AEGIS_ENVIRONMENT=prod`` with no valid policy denies every call.
+        """
         self.db_path = db_path or settings.db_path
-        self.policy_engine = policy_engine or PolicyEngine.from_path(
-            settings.policy_path
+        self.policy_engine = policy_engine or build_policy_engine(
+            settings.policy_path, settings.environment
         )
         self._init_db()
 
-    def _apply_rbac(self, request: MCPToolCallRequest, violations: list[str]) -> bool:
-        """Append the RBAC violation if the matrix denies the call; return denial."""
-        denied = not self.policy_engine.is_allowed(
+    def _apply_rbac(
+        self, request: MCPToolCallRequest, violations: list[str]
+    ) -> tuple[bool, str]:
+        """Evaluate RBAC against one atomic policy snapshot.
+
+        Appends ``rbac_policy_denied`` (plus ``policy_fail_closed`` under the
+        startup deny-all fallback) and returns ``(denied, policy_version)``.
+        """
+        document, version, fail_closed = self.policy_engine.snapshot()
+        denied = not evaluate_policy(
+            document,
             agent_id=request.agent_id,
             server_name=request.server_name,
             tool_name=request.tool_name,
@@ -113,7 +147,24 @@ class MCPFirewall:
         )
         if denied:
             violations.append(RBAC_VIOLATION)
-        return denied
+            if fail_closed:
+                violations.append(FAIL_CLOSED_VIOLATION)
+        return denied, version
+
+    @staticmethod
+    def _decide(
+        risk_score: int, denied: bool, redacted: bool
+    ) -> tuple[bool, Decision, bool]:
+        """Map the evaluation to ``(allowed, decision, would_block)``.
+
+        In ``monitor`` (shadow) mode nothing is blocked: the call keeps its
+        ALLOWED/SANITIZED decision and ``would_block`` records the verdict
+        enforce mode would have reached.
+        """
+        would_block = denied or risk_score >= settings.block_threshold_score
+        if would_block and settings.policy_mode == "enforce":
+            return False, "BLOCKED", True
+        return True, "SANITIZED" if redacted else "ALLOWED", would_block
 
     def _init_db(self) -> None:
         """Create the audit_ledger table if it does not exist."""
@@ -135,7 +186,18 @@ class MCPFirewall:
                     timestamp TEXT NOT NULL
                 )
                 """)
+            self._migrate(cursor)
             conn.commit()
+
+    @staticmethod
+    def _migrate(cursor: sqlite3.Cursor) -> None:
+        """Add columns missing from ledgers created by older releases."""
+        cursor.execute("PRAGMA table_info(audit_ledger)")
+        existing = {str(row[1]) for row in cursor.fetchall()}
+        for column, ddl in LEDGER_MIGRATIONS:
+            if column not in existing:
+                # Column names and DDL are module constants, never user input.
+                cursor.execute(f"ALTER TABLE audit_ledger ADD COLUMN {column} {ddl}")
 
     def _get_last_hash(self, cursor: sqlite3.Cursor) -> str:
         """Fetch the most recent entry_hash or return the genesis hash."""
@@ -147,7 +209,7 @@ class MCPFirewall:
         """Inspect an MCP tool call, redact PII/secrets, and append to hash ledger."""
         raw_serialized = json.dumps(request.arguments, sort_keys=True)
         risk_score, violations = evaluate_threats(raw_serialized)
-        rbac_denied = self._apply_rbac(request, violations)
+        rbac_denied, version = self._apply_rbac(request, violations)
         if rbac_denied:
             risk_score = RBAC_RISK_SCORE
 
@@ -158,13 +220,10 @@ class MCPFirewall:
             if redacted_categories and risk_score < 25:
                 risk_score = 25
 
-        allowed = risk_score < settings.block_threshold_score and not rbac_denied
-        decision: Literal["ALLOWED", "SANITIZED", "BLOCKED"] = "ALLOWED"
-        if not allowed:
-            decision = "BLOCKED"
-        elif redacted_categories:
-            decision = "SANITIZED"
-
+        allowed, decision, would_block = self._decide(
+            risk_score, rbac_denied, bool(redacted_categories)
+        )
+        mode = settings.policy_mode
         ts_iso = request.timestamp.isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
@@ -184,8 +243,9 @@ class MCPFirewall:
                 INSERT INTO audit_ledger (
                     agent_id, server_name, tool_name, environment,
                     decision, risk_score, violations_json, redacted_json,
-                    prev_hash, entry_hash, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    prev_hash, entry_hash, timestamp,
+                    would_block, policy_mode, policy_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.agent_id,
@@ -199,6 +259,9 @@ class MCPFirewall:
                     prev_hash,
                     entry_hash,
                     ts_iso,
+                    int(would_block),
+                    mode,
+                    version,
                 ),
             )
             conn.commit()
@@ -213,6 +276,9 @@ class MCPFirewall:
             audit_hash=entry_hash,
             prev_hash=prev_hash,
             timestamp=request.timestamp,
+            would_block=would_block,
+            policy_mode=mode,
+            policy_version=version,
         )
 
     def list_audit_entries(self, agent_id: str | None = None) -> list[AuditEntry]:
@@ -221,19 +287,11 @@ class MCPFirewall:
             cursor = conn.cursor()
             if agent_id:
                 cursor.execute(
-                    "SELECT id, agent_id, server_name, tool_name, environment, "
-                    "decision, risk_score, violations_json, redacted_json, "
-                    "prev_hash, entry_hash, timestamp "
-                    "FROM audit_ledger WHERE agent_id = ? ORDER BY id ASC",
+                    LEDGER_SELECT + " WHERE agent_id = ? ORDER BY id ASC",
                     (agent_id,),
                 )
             else:
-                cursor.execute(
-                    "SELECT id, agent_id, server_name, tool_name, environment, "
-                    "decision, risk_score, violations_json, redacted_json, "
-                    "prev_hash, entry_hash, timestamp "
-                    "FROM audit_ledger ORDER BY id ASC"
-                )
+                cursor.execute(LEDGER_SELECT + " ORDER BY id ASC")
             rows = cursor.fetchall()
 
         entries: list[AuditEntry] = []
@@ -252,6 +310,9 @@ class MCPFirewall:
                     prev_hash=str(row[9]),
                     entry_hash=str(row[10]),
                     timestamp=str(row[11]),
+                    would_block=bool(row[12]),
+                    policy_mode=str(row[13]),
+                    policy_version=str(row[14]),
                 )
             )
         return entries

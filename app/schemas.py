@@ -12,6 +12,8 @@ from pydantic import (
 )
 
 Environment = Literal["dev", "staging", "prod"]
+PolicyMode = Literal["enforce", "monitor"]
+Decision = Literal["ALLOWED", "SANITIZED", "BLOCKED"]
 
 GlobPattern = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 """Case-sensitive ``fnmatch`` glob (``*``, ``?``, ``[seq]``) for RBAC matching."""
@@ -98,6 +100,18 @@ class MCPInspectionResponse(BaseModel):
         ...,
         description="UTC timestamp of the firewall evaluation.",
     )
+    would_block: bool = Field(
+        default=False,
+        description="True if enforce mode would block the call (shadow signal).",
+    )
+    policy_mode: PolicyMode = Field(
+        default="enforce",
+        description="Policy mode that produced the decision (enforce|monitor).",
+    )
+    policy_version: str = Field(
+        default="",
+        description="SHA-256 (RFC 8785 JCS) of the policy document that decided.",
+    )
 
 
 class AuditEntry(BaseModel):
@@ -124,6 +138,13 @@ class AuditEntry(BaseModel):
     prev_hash: str = Field(..., description="Previous entry SHA-256 hash.")
     entry_hash: str = Field(..., description="Current entry SHA-256 hash.")
     timestamp: str = Field(..., description="ISO-8601 UTC timestamp.")
+    would_block: bool = Field(
+        default=False, description="Shadow signal: enforce mode would block."
+    )
+    policy_mode: str = Field(default="enforce", description="enforce|monitor.")
+    policy_version: str = Field(
+        default="", description="SHA-256 of the deciding policy document."
+    )
 
 
 class ChainVerificationResponse(BaseModel):
@@ -189,6 +210,17 @@ class PolicyRule(BaseModel):
         if not self.allow_tools and not self.deny_tools:
             raise ValueError("RBAC rule must declare allow_tools or deny_tools.")
         return self
+
+
+class PolicyStatus(BaseModel):
+    """Operational state of the active policy (version, mode, fail-closed)."""
+
+    policy_version: str = Field(..., description="SHA-256 of the active document.")
+    policy_mode: PolicyMode = Field(..., description="enforce|monitor.")
+    environment: Environment = Field(..., description="Gateway deployment env.")
+    fail_closed: bool = Field(
+        ..., description="True while the startup deny-all fallback is active."
+    )
 
 
 class PolicyDocument(BaseModel):

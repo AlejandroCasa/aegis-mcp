@@ -370,6 +370,7 @@ class JsonRpcGateway:
             decision=report.decision,
             violations=report.violations,
             redacted_categories=report.redacted_categories,
+            would_block=report.would_block,
         )
         if not report.allowed:
             raise JsonRpcError(

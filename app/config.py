@@ -7,6 +7,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.auth import AuthMode, OAuthConfig
+from app.schemas import Environment, PolicyMode
 
 
 def _default_db_path() -> str:
@@ -24,6 +25,12 @@ class Settings(BaseSettings):
     block_threshold_score: int = 70
     enable_dlp_redaction: bool = True
     policy_path: str | None = None
+    # Deployment environment of this gateway: ``prod`` fails closed (deny-all)
+    # when no valid policy is loaded at startup.
+    environment: Environment = "dev"
+    # ``enforce`` blocks; ``monitor`` (shadow mode) evaluates and audits
+    # ``would_block`` without blocking, for progressive production rollouts.
+    policy_mode: PolicyMode = "enforce"
     mcp_upstreams: dict[str, str] = Field(default_factory=dict)
     upstream_timeout_seconds: float = 10.0
 
