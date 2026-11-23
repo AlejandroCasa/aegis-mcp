@@ -9,8 +9,10 @@ Request pipeline for ``POST /api/v1/mcp/jsonrpc``:
 3. Run ``MCPFirewall.inspect`` (threat rules, RBAC matrix, inbound DLP,
    SHA-256 audit ledger). Blocked calls return ``-32003``.
 4. Forward the sanitized envelope to the server-configured upstream (never a
-   caller-supplied URL), then DLP-redact the upstream ``result``/``error``
-   before relaying it with the caller's original ``id``.
+   caller-supplied URL) on a fresh request carrying no caller credentials
+   (no token passthrough / confused-deputy mitigation), then DLP-redact the
+   upstream ``result``/``error`` before relaying it with the caller's
+   original ``id``.
 
 RBAC ``tool_name`` mapping: ``tools/call`` uses ``params.name``; the other
 methods use the method name itself (``resources/read``, ``prompts/get``).
@@ -25,6 +27,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from app.auth import strip_credentials
 from app.config import settings
 from app.firewall import MCPFirewall
 from app.metrics import metrics_registry
@@ -393,10 +396,15 @@ class JsonRpcGateway:
             "params": params,
         }
         try:
-            with self.client.stream("POST", url, json=outbound) as response:
+            request = self.client.build_request("POST", url, json=outbound)
+            strip_credentials(request.headers)
+            response = self.client.send(request, stream=True)
+            try:
                 if response.status_code != httpx.codes.OK:
                     raise _upstream_failure()
                 body = _read_capped(response, deadline)
+            finally:
+                response.close()
             payload = json.loads(body, parse_constant=_reject_constant)
         except (httpx.HTTPError, ValueError, RecursionError) as exc:
             raise _upstream_failure() from exc

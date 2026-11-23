@@ -4,6 +4,7 @@ import logging
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import (
     Depends,
@@ -19,6 +20,13 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from starlette.concurrency import run_in_threadpool
 
+from app.auth import (
+    WELL_KNOWN_PATH,
+    AuthError,
+    AuthUnavailableError,
+    Principal,
+    build_resource_server,
+)
 from app.config import settings
 from app.firewall import MCPFirewall
 from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
@@ -39,6 +47,7 @@ if settings.policy_path is None:
     logger.warning("AEGIS_POLICY_PATH is not set: RBAC matrix defaults to allow-all.")
 firewall = MCPFirewall(policy_engine=policy_engine)
 jsonrpc_gateway = JsonRpcGateway(firewall=firewall)
+resource_server = build_resource_server(settings.auth_mode, settings.oauth_config)
 
 
 @asynccontextmanager
@@ -70,6 +79,38 @@ def verify_api_key(api_key: str | None = Security(api_key_header)) -> str | None
             detail="Invalid or missing X-API-Key authentication header.",
         )
     return api_key
+
+
+def authenticate(
+    api_key: str | None = Security(api_key_header),
+    authorization: str | None = Header(default=None),
+) -> Principal | None:
+    """Authenticate a data-plane caller according to ``AEGIS_AUTH_MODE``.
+
+    ``api_key`` mode keeps the local-development X-API-Key check and returns
+    ``None`` (identity is self-declared). ``oauth`` mode requires a valid
+    Bearer JWT and returns the claims-derived Principal; failures yield ``401``
+    with an RFC 6750 / RFC 9728 ``WWW-Authenticate`` challenge.
+    """
+    if not resource_server.enabled:
+        verify_api_key(api_key)
+        return None
+    try:
+        return resource_server.authenticate(authorization)
+    except AuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=exc.description,
+            headers={"WWW-Authenticate": resource_server.challenge(exc)},
+        ) from exc
+    except AuthUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authorization server signing keys are unavailable.",
+        ) from exc
+
+
+AuthenticatedPrincipal = Annotated[Principal | None, Depends(authenticate)]
 
 
 def require_admin_api_key(
@@ -120,14 +161,30 @@ def get_metrics() -> Response:
     )
 
 
+@app.get(WELL_KNOWN_PATH, tags=["OAuth"])
+@app.get(WELL_KNOWN_PATH + "/{resource_path:path}", tags=["OAuth"])
+def protected_resource_metadata(request: Request) -> JSONResponse:
+    """Serve RFC 9728 OAuth 2.0 Protected Resource Metadata (OAuth mode only)."""
+    if not resource_server.serves_metadata_path(request.url.path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return JSONResponse(
+        resource_server.metadata(),
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.post(
     "/api/v1/mcp/inspect",
     response_model=MCPInspectionResponse,
-    dependencies=[Depends(verify_api_key)],
     tags=["MCP Firewall"],
 )
-def inspect_mcp_tool_call(request: MCPToolCallRequest) -> MCPInspectionResponse:
+def inspect_mcp_tool_call(
+    request: MCPToolCallRequest,
+    principal: AuthenticatedPrincipal,
+) -> MCPInspectionResponse:
     """Inspect an MCP tool call, redact sensitive fields, and record in hash chain."""
+    if principal is not None:
+        request = request.model_copy(update={"agent_id": principal.agent_id})
     report = firewall.inspect(request)
     metrics_registry.record_inspection(
         server_name=request.server_name,
@@ -141,7 +198,7 @@ def inspect_mcp_tool_call(request: MCPToolCallRequest) -> MCPInspectionResponse:
 @app.get(
     "/api/v1/audit",
     response_model=list[AuditEntry],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(authenticate)],
     tags=["Audit Ledger"],
 )
 def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
@@ -152,7 +209,7 @@ def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
 @app.get(
     "/api/v1/audit/verify",
     response_model=ChainVerificationResponse,
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(authenticate)],
     tags=["Audit Ledger"],
 )
 def verify_audit_chain() -> ChainVerificationResponse:
@@ -200,20 +257,24 @@ async def read_body_capped(request: Request, limit: int) -> bytes:
 
 @app.post(
     "/api/v1/mcp/jsonrpc",
-    dependencies=[Depends(verify_api_key)],
     tags=["MCP Firewall"],
     response_class=JSONResponse,
 )
 async def mcp_jsonrpc_proxy(
     request: Request,
+    principal: AuthenticatedPrincipal,
     x_aegis_agent_id: str | None = Header(default=None),
     x_aegis_mcp_server: str | None = Header(default=None),
     x_aegis_environment: str | None = Header(default=None),
 ) -> JSONResponse:
-    """Firewall, audit, and proxy a JSON-RPC 2.0 MCP request to its upstream."""
+    """Firewall, audit, and proxy a JSON-RPC 2.0 MCP request to its upstream.
+
+    In OAuth mode the agent identity comes only from the validated token; a
+    self-declared ``X-Aegis-Agent-Id`` header is ignored.
+    """
     raw = await read_body_capped(request, MAX_REQUEST_BYTES)
     routing = {
-        "agent_id": x_aegis_agent_id,
+        "agent_id": principal.agent_id if principal else x_aegis_agent_id,
         "server_name": x_aegis_mcp_server,
         "environment": x_aegis_environment,
     }
