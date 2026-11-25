@@ -104,7 +104,90 @@ uv run black --check . && uv run isort --check-only --profile black . && uv run 
 uv run mypy --strict app tests fuzz scripts
 uv run pytest -v --cov=app --cov-report=term-missing --cov-fail-under=85
 uv run python -m fuzz.fuzz_firewall --self-test
+uv run python -m scripts.evaluate_detection --min-recall 0.95 --max-fpr 0.02 --min-cases 300
 ```
+
+---
+
+## Detection Benchmark
+
+`benchmarks/corpus/*.jsonl` holds a reproducible, labeled corpus of **348 cases** (154 benign, 194 malicious). It is generated deterministically by `scripts/build_benchmark_corpus.py`. Attack strings and encodings are assembled at runtime, and secret-shaped DLP values are stored as `{{SYNTH_*}}` macros that the evaluator expands in memory, so no real credential is committed. `scripts/evaluate_detection.py` runs every case against Aegis-MCP in-process, using a temporary audit ledger and per-case policy and taint isolation. It enforces the CI gate `recall >= 0.95`, `FPR <= 0.02`, `cases >= 300`, plus an intact audit hash chain. The exit code is `0` on pass, `1` on a failed KPI, and `2` on an invalid corpus.
+
+```bash
+uv run python -m scripts.build_benchmark_corpus      # regenerate the corpus
+uv run python -m scripts.evaluate_detection --json   # machine-readable report
+```
+
+### Corpus schema
+
+Every record has `id`, `category`, `expected_flagged`, `kind`, and three taxonomy tags: `owasp_llm_2025`, `owasp_agentic`, and `mitre_atlas` (`N/A` for benign). Each `kind` selects an engine and its own flagging rule:
+
+| `kind` | Engine | Flagged when |
+| :--- | :--- | :--- |
+| `inspect` | `MCPFirewall.inspect` (threat rules, RBAC/ABAC `policy`, DLP) | enforce mode would block, or DLP redacted a category |
+| `tool_definition` | `app.poisoning.scan_definition` | a finding scores at least the block threshold (70) |
+| `session_flow` | `MCPFirewall.inspect` over ordered steps sharing one session | any step would be blocked (e.g. toxic-flow taint) |
+
+Benign cases are realistic developer traffic. They include `SELECT` queries, git operations, workspace file reads, Markdown with code blocks, JSON and Kubernetes payloads, UUIDs, SHA-256 digests, timestamps, Luhn-invalid order IDs, and mod-97-invalid IBAN look-alikes. Multi-step sessions in the benign set are missing one leg of the lethal trifecta.
+
+### Measured results
+
+The figures below are the evaluator's output for the committed corpus. Latency is per case, measured in-process on a developer workstation, and varies by host.
+
+| Metric | Value |
+| :--- | :--- |
+| Cases | 348 |
+| TP / FP / TN / FN | 185 / 0 / 154 / 9 |
+| Precision | 1.0000 |
+| Recall | 0.9536 |
+| F1 | 0.9763 |
+| False positive rate | 0.0000 |
+| Latency p50 / p99 | 0.63 ms / 4.07 ms |
+
+| Category | Cases | TP | FN | Recall |
+| :--- | ---: | ---: | ---: | ---: |
+| `prompt_injection` | 25 | 24 | 1 | 0.960 |
+| `command_injection` | 22 | 20 | 2 | 0.909 |
+| `destructive_sql` | 17 | 15 | 2 | 0.882 |
+| `path_traversal` | 20 | 20 | 0 | 1.000 |
+| `evasion_obfuscated` | 25 | 24 | 1 | 0.960 |
+| `tool_poisoning` | 22 | 20 | 2 | 0.909 |
+| `abac_constraint` | 20 | 20 | 0 | 1.000 |
+| `toxic_flow` | 17 | 16 | 1 | 0.941 |
+| `dlp_redaction` | 26 | 26 | 0 | 1.000 |
+| `benign` (TN / FP) | 154 | 154 TN | 0 FP | FPR 0.000 |
+
+### Taxonomy coverage (malicious cases)
+
+| Taxonomy | Tag | Cases | Recall |
+| :--- | :--- | ---: | ---: |
+| OWASP LLM Top 10 2025 | LLM01:2025 Prompt Injection | 50 | 0.960 |
+| OWASP LLM Top 10 2025 | LLM02:2025 Sensitive Information Disclosure | 63 | 0.984 |
+| OWASP LLM Top 10 2025 | LLM03:2025 Supply Chain | 22 | 0.909 |
+| OWASP LLM Top 10 2025 | LLM05:2025 Improper Output Handling | 22 | 0.909 |
+| OWASP LLM Top 10 2025 | LLM06:2025 Excessive Agency | 37 | 0.946 |
+| OWASP Agentic AI Threats | ASI01 Goal Hijack | 50 | 0.960 |
+| OWASP Agentic AI Threats | ASI02 Tool Misuse | 59 | 0.932 |
+| OWASP Agentic AI Threats | ASI03 Identity & Privilege Abuse | 46 | 1.000 |
+| OWASP Agentic AI Threats | ASI04 Supply Chain / Tool Poisoning | 22 | 0.909 |
+| OWASP Agentic AI Threats | ASI07 Memory & Context Poisoning | 17 | 0.941 |
+| MITRE ATLAS | AML.T0010 ML Supply Chain Compromise | 22 | 0.909 |
+| MITRE ATLAS | AML.T0048 External Harms / Exfiltration | 17 | 0.941 |
+| MITRE ATLAS | AML.T0051 LLM Prompt Injection | 25 | 0.960 |
+| MITRE ATLAS | AML.T0053 LLM Plugin Compromise | 59 | 0.932 |
+| MITRE ATLAS | AML.T0054 LLM Jailbreak | 25 | 0.960 |
+| MITRE ATLAS | AML.T0057 LLM Data Leakage | 46 | 1.000 |
+
+### Known detection gaps
+
+The corpus keeps 9 documented false negatives, each labeled `known gap` in its `description`. The gate asserts that every miss is one of them:
+
+- Prompt injection whose words are separated by newlines or tabs. JSON serialization escapes the control whitespace, so the phrase never reaches the regex in contiguous form.
+- Command substitution with backticks, and `&&` chaining to a downloader.
+- SQL keywords separated by inline comments, and an unbounded `DELETE` without a tautology. Use `sql_mode: read_only` to cover these.
+- `0x`-prefixed hex payloads, which are not decoded.
+- An http(s) URL embedded in prose on a non-sink tool. Egress detection only matches values that start with a scheme.
+- Medium-severity poisoning signals on their own, such as a context-siphoning parameter name or a bare cross-server name collision. These score 60, below the block threshold.
 
 ---
 

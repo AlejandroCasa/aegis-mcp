@@ -42,6 +42,9 @@ jobs:
       - name: Phase 1.4 — Deterministic Unit & Integration Test Suite (0 Warnings, >=85% Cov)
         run: uv run pytest -v --cov=app --cov-report=term-missing --cov-fail-under=85
 
+      - name: Phase 1.5 — Detection Benchmark Gate (OWASP / ATLAS Corpus, Recall & FPR)
+        run: uv run python -m scripts.evaluate_detection --min-recall 0.95 --max-fpr 0.02 --min-cases 300
+
       # =========================================================================
       # PHASE 2: SAST, SCA & Complexity Governance
       # =========================================================================
