@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     db_path: str = Field(default_factory=_default_db_path)
     block_threshold_score: int = 70
     enable_dlp_redaction: bool = True
+    # Optional HMAC-SHA256 key for referential DLP tokens: when set, redacted
+    # values become ``[REDACTED_<LABEL>#<6hex>]`` so identical values stay
+    # correlatable without exposing them. Unset/empty emits static placeholders.
+    dlp_hmac_key: str | None = None
+    # Shannon-entropy detection of unlabelled secrets in explicit secret
+    # contexts (``password=...`` assignments and sensitive dictionary keys).
+    dlp_entropy_enabled: bool = True
     policy_path: str | None = None
     # Deployment environment of this gateway: ``prod`` fails closed (deny-all)
     # when no valid policy is loaded at startup.
