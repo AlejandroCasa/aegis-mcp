@@ -1,11 +1,17 @@
 """CLI hook runner connecting Claude Code + ECC lifecycle events to Aegis-MCP."""
 
 import json
+import select
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
-from app.claude_guard import (
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from app.claude_guard import (  # noqa: E402
     evaluate_post_tool_event,
     evaluate_pre_tool_event,
     verify_audit_chain_integrity,
@@ -67,9 +73,22 @@ QUALITY_GATE_COMMANDS: tuple[tuple[str, list[str]], ...] = (
 )
 
 
+def _has_stdin_data() -> bool:
+    """Return True if stdin has readable data without blocking on open pipes."""
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return True
+    try:
+        ready, _, _ = select.select([fd], [], [], 0.25)
+        return bool(ready)
+    except (OSError, ValueError):
+        return False
+
+
 def _read_stdin_json() -> dict[str, Any]:
-    """Read and parse JSON hook payload from stdin safely."""
-    if sys.stdin.isatty():
+    """Read and parse JSON hook payload from stdin without hanging on open pipes."""
+    if sys.stdin.isatty() or not _has_stdin_data():
         return {}
     raw = sys.stdin.read().strip()
     if not raw:
@@ -88,7 +107,17 @@ def run_stop_gate() -> tuple[int, str]:
         return 2, f"Aegis-MCP SHA-256 Audit Chain Corrupted: {chain_json}"
 
     for gate_name, cmd in QUALITY_GATE_COMMANDS:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return 2, f"[CTO Stop Gate Blocked: {gate_name} timed out after 120s]"
         if proc.returncode != 0:
             details = (proc.stdout + "\n" + proc.stderr).strip()
             return (
@@ -104,14 +133,13 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch Claude Code hook event to the corresponding Aegis-MCP handler."""
     args = argv if argv is not None else sys.argv[1:]
     mode = args[0] if args else "pre-tool"
-    payload = _read_stdin_json()
 
-    if mode == "pre-tool":
-        code, message = evaluate_pre_tool_event(payload)
-    elif mode == "post-tool":
-        code, message = evaluate_post_tool_event(payload)
-    elif mode == "stop-gate":
+    if mode == "stop-gate":
         code, message = run_stop_gate()
+    elif mode == "pre-tool":
+        code, message = evaluate_pre_tool_event(_read_stdin_json())
+    elif mode == "post-tool":
+        code, message = evaluate_post_tool_event(_read_stdin_json())
     else:
         sys.stderr.write(f"Unknown mode: {mode}\n")
         return 2

@@ -139,3 +139,43 @@ def test_post_tool_and_chain_verification(tmp_path: Path) -> None:
     assert valid is True
     verify_data = json.loads(verify_json)
     assert verify_data["total_entries"] == 2
+
+
+def test_stop_gate_skips_blocking_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify stop-gate never reads stdin even when invoked with an open pipe."""
+    from scripts import claude_aegis_guard
+
+    class _ExplodingStdin:
+        def isatty(self) -> bool:
+            return False
+
+        def read(self) -> str:
+            raise AssertionError("stop-gate must not read stdin")
+
+    monkeypatch.setattr("sys.stdin", _ExplodingStdin())
+    monkeypatch.setattr(
+        claude_aegis_guard,
+        "run_stop_gate",
+        lambda: (0, json.dumps({"status": "ALL_GATES_PASSED"})),
+    )
+
+    assert claude_aegis_guard.main(["stop-gate"]) == 0
+
+
+def test_read_stdin_json_returns_empty_on_idle_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify _read_stdin_json returns {} immediately when pipe has no ready bytes."""
+    from scripts import claude_aegis_guard
+
+    class _IdlePipeStdin:
+        def isatty(self) -> bool:
+            return False
+
+        def read(self) -> str:
+            raise AssertionError("_read_stdin_json must not block on idle pipe")
+
+    monkeypatch.setattr("sys.stdin", _IdlePipeStdin())
+    monkeypatch.setattr(claude_aegis_guard, "_has_stdin_data", lambda: False)
+
+    assert claude_aegis_guard._read_stdin_json() == {}
