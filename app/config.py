@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     # findings scoring >= block_threshold_score hide the definition (and strip
     # poisoned ``instructions``) and block calls in enforce mode.
     toolguard_scan_poisoning: bool = True
+    # Toxic-flow ("lethal trifecta") session taint tracking: deny egress sinks
+    # once a session has seen both untrusted content and private data.
+    # ``taint_default_heuristics`` adds built-in tool/server classification
+    # on top of the policy's declarative ``taint_rules``.
+    enable_taint_tracking: bool = True
+    taint_default_heuristics: bool = True
     mcp_upstreams: dict[str, str] = Field(default_factory=dict)
     upstream_timeout_seconds: float = 10.0
 

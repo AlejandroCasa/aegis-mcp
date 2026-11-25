@@ -14,6 +14,8 @@ from pydantic import (
 Environment = Literal["dev", "staging", "prod"]
 PolicyMode = Literal["enforce", "monitor"]
 Decision = Literal["ALLOWED", "SANITIZED", "BLOCKED"]
+TaintRole = Literal["untrusted_content", "private_data", "egress_sink"]
+TaintLabel = Literal["untrusted_content", "private_data"]
 
 GlobPattern = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 """Case-sensitive ``fnmatch`` glob (``*``, ``?``, ``[seq]``) for RBAC matching."""
@@ -56,6 +58,11 @@ class MCPToolCallRequest(BaseModel):
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="UTC timestamp of the tool invocation.",
+    )
+    session_id: str = Field(
+        default="",
+        max_length=1024,
+        description="Optional agent session for toxic-flow taint tracking.",
     )
 
 
@@ -360,6 +367,44 @@ class PolicyStatus(BaseModel):
     )
 
 
+class ToolTaintRule(BaseModel):
+    """Declarative toxic-flow taint classification for matching tools.
+
+    Every matching rule contributes its ``roles`` (union); explicit rules are
+    combined with the built-in heuristics unless those are disabled.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_name: GlobPattern = Field(default="*", description="Server glob.")
+    tool_name: GlobPattern = Field(default="*", description="Tool-name glob.")
+    environments: list[Environment] = Field(
+        default_factory=_all_environments, min_length=1, max_length=3
+    )
+    roles: list[TaintRole] = Field(
+        ...,
+        min_length=1,
+        max_length=3,
+        description="untrusted_content | private_data | egress_sink.",
+    )
+
+
+class SessionTaintStatus(BaseModel):
+    """Toxic-flow taint state of one agent session (observability)."""
+
+    session_id: str = Field(..., description="Agent / MCP session identifier.")
+    labels: list[TaintLabel] = Field(
+        default_factory=list, description="Taint labels held by the session."
+    )
+    lethal_trifecta_armed: bool = Field(
+        ..., description="True when any egress sink would now be denied."
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Bounded provenance (``<tool>:<label>``), oldest first.",
+    )
+
+
 class PolicyDocument(BaseModel):
     """Declarative RBAC policy matrix applied to every MCP tool call."""
 
@@ -378,4 +423,9 @@ class PolicyDocument(BaseModel):
         default_factory=list,
         max_length=1024,
         description="Argument-level ABAC constraints (all matching apply).",
+    )
+    taint_rules: list[ToolTaintRule] = Field(
+        default_factory=list,
+        max_length=1024,
+        description="Toxic-flow taint classification (lethal trifecta defense).",
     )

@@ -11,6 +11,7 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Path,
     Request,
     Response,
     Security,
@@ -39,6 +40,7 @@ from app.schemas import (
     MCPToolCallRequest,
     PolicyDocument,
     PolicyStatus,
+    SessionTaintStatus,
     ToolApproval,
     ToolPin,
 )
@@ -115,6 +117,9 @@ def authenticate(
 
 
 AuthenticatedPrincipal = Annotated[Principal | None, Depends(authenticate)]
+SessionIdHeader = Annotated[
+    str | None, Header(max_length=1024, pattern=r"^[\x21-\x7e]+$")
+]
 
 
 def require_admin_api_key(
@@ -185,11 +190,16 @@ def protected_resource_metadata(request: Request) -> JSONResponse:
 def inspect_mcp_tool_call(
     request: MCPToolCallRequest,
     principal: AuthenticatedPrincipal,
+    x_aegis_session_id: SessionIdHeader = None,
 ) -> MCPInspectionResponse:
-    """Inspect an MCP tool call, redact sensitive fields, and record in hash chain."""
+    """Inspect an MCP tool call, redact sensitive fields, and record in hash chain.
+
+    ``X-Aegis-Session-Id`` (or the body ``session_id``) opts the call into
+    toxic-flow taint tracking.
+    """
     if principal is not None:
         request = request.model_copy(update={"agent_id": principal.agent_id})
-    report = firewall.inspect(request)
+    report = firewall.inspect(request, session_id=x_aegis_session_id or "")
     metrics_registry.record_inspection(
         server_name=request.server_name,
         decision=report.decision,
@@ -220,6 +230,19 @@ def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
 def verify_audit_chain() -> ChainVerificationResponse:
     """Verify the cryptographic integrity of the SHA-256 hash chain."""
     return firewall.verify_chain()
+
+
+@app.get(
+    "/api/v1/sessions/{session_id}/taint",
+    response_model=SessionTaintStatus,
+    dependencies=[Depends(authenticate)],
+    tags=["Taint Tracking"],
+)
+def get_session_taint(
+    session_id: Annotated[str, Path(min_length=1, max_length=1024)],
+) -> SessionTaintStatus:
+    """Return a session's toxic-flow taint labels and lethal-trifecta state."""
+    return firewall.taint.status(session_id)
 
 
 @app.get(
@@ -331,6 +354,7 @@ async def mcp_jsonrpc_proxy(
     x_aegis_agent_id: str | None = Header(default=None),
     x_aegis_mcp_server: str | None = Header(default=None),
     x_aegis_environment: str | None = Header(default=None),
+    x_aegis_session_id: str | None = Header(default=None),
 ) -> JSONResponse:
     """Firewall, audit, and proxy a JSON-RPC 2.0 MCP request to its upstream.
 
@@ -342,6 +366,7 @@ async def mcp_jsonrpc_proxy(
         "agent_id": principal.agent_id if principal else x_aegis_agent_id,
         "server_name": x_aegis_mcp_server,
         "environment": x_aegis_environment,
+        "session_id": x_aegis_session_id,
     }
     payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
     return JSONResponse(payload)

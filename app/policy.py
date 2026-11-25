@@ -116,8 +116,13 @@ def evaluate_policy(
 
 
 def policy_version(document: PolicyDocument) -> str:
-    """Return the SHA-256 of the document's RFC 8785 canonical JSON form."""
-    return sha256_hex(document.model_dump(mode="json"))
+    """Return the SHA-256 of the document's RFC 8785 canonical JSON form.
+
+    An empty ``taint_rules`` list is omitted so documents predating taint
+    rules keep their historical ``policy_version``.
+    """
+    exclude = None if document.taint_rules else {"taint_rules"}
+    return sha256_hex(document.model_dump(mode="json", exclude=exclude))
 
 
 def fail_closed_document() -> PolicyDocument:

@@ -27,6 +27,7 @@ drifted definitions are filtered and audited as ``tool_definition_drift``, and
 """
 
 import json
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -41,7 +42,12 @@ from app.firewall import MCPFirewall
 from app.metrics import metrics_registry
 from app.poisoning import POISONING_VIOLATION, blocking_rules
 from app.redactor import redact_payload, redact_text
-from app.schemas import Environment, MCPInspectionResponse, MCPToolCallRequest
+from app.schemas import (
+    Environment,
+    MCPInspectionResponse,
+    MCPToolCallRequest,
+    TaintLabel,
+)
 from app.toolguard import (
     DRIFT_VIOLATION,
     LIST_METHODS,
@@ -62,6 +68,8 @@ RESERVED_GATEWAY_CODES = frozenset({POLICY_BLOCKED, UPSTREAM_ERROR})
 MAX_REQUEST_BYTES = 1_048_576
 MAX_UPSTREAM_BYTES = 5_242_880
 MAX_IDENTIFIER_LENGTH = 256
+SESSION_ID_PATTERN = re.compile(r"[\x21-\x7e]{1,1024}")
+PRIVATE_DATA: frozenset[TaintLabel] = frozenset({"private_data"})
 
 RequestId = str | int | None
 
@@ -169,9 +177,16 @@ def parse_envelope(payload: Any) -> Envelope:
 
 
 def build_context(
-    agent_id: str | None, server_name: str | None, environment: str | None
+    agent_id: str | None,
+    server_name: str | None,
+    environment: str | None,
+    session_id: str | None = None,
 ) -> CallContext:
-    """Validate ``X-Aegis-*`` routing headers into a CallContext."""
+    """Validate ``X-Aegis-*`` routing headers into a CallContext.
+
+    ``session_id`` (``X-Aegis-Session-Id``) opts stateless JSON-RPC calls
+    into toxic-flow taint tracking; it must be 1-1024 printable ASCII chars.
+    """
     agent = agent_id or "default-agent"
     env = _ENVIRONMENTS.get(environment or "prod")
     if (
@@ -179,9 +194,15 @@ def build_context(
         or not server_name
         or len(server_name) > MAX_IDENTIFIER_LENGTH
         or len(agent) > MAX_IDENTIFIER_LENGTH
+        or (session_id and not SESSION_ID_PATTERN.fullmatch(session_id))
     ):
         raise JsonRpcError(INVALID_REQUEST, "Invalid X-Aegis-* routing headers.")
-    return CallContext(agent_id=agent, server_name=server_name, environment=env)
+    return CallContext(
+        agent_id=agent,
+        server_name=server_name,
+        environment=env,
+        session_id=session_id or "",
+    )
 
 
 def _require_name(params: dict[str, Any]) -> str:
@@ -274,13 +295,25 @@ def _drift_error(violations: list[str], audit_hash: str) -> JsonRpcError:
     )
 
 
-def redact_value(value: Any) -> Any:
-    """DLP-redact any JSON value when enabled, counting categories in metrics."""
+def redact_tracked(value: Any) -> tuple[Any, list[str]]:
+    """DLP-redact any JSON value; return ``(sanitized, categories)``."""
     if not settings.enable_dlp_redaction:
-        return value
+        return value, []
     sanitized, categories = redact_payload({"value": value})
     metrics_registry.record_redactions(categories)
-    return sanitized["value"]
+    return sanitized["value"], categories
+
+
+def redact_value(value: Any) -> Any:
+    """DLP-redact any JSON value when enabled, counting categories in metrics."""
+    return redact_tracked(value)[0]
+
+
+def call_subject(envelope: Envelope) -> str:
+    """Taint provenance subject: the tool/prompt name, else the method."""
+    params = envelope.params
+    name = params.get("name") if isinstance(params, dict) else None
+    return name if isinstance(name, str) else envelope.method
 
 
 def reject_constant(token: str) -> Any:
@@ -370,6 +403,7 @@ class JsonRpcGateway:
                 routing.get("agent_id"),
                 routing.get("server_name"),
                 routing.get("environment"),
+                routing.get("session_id"),
             )
             tool_name, params = resolve_call(envelope)
             return self._process(envelope, context, tool_name, params)
@@ -640,10 +674,19 @@ class JsonRpcGateway:
     ) -> dict[str, Any]:
         """Screen + redact the upstream result/error, bound to the caller's id."""
         req_id = envelope.req_id
+        subject = call_subject(envelope)
         if "result" in upstream:
             result = self.screen_result(envelope.method, context, upstream["result"])
-            return success_response(req_id, redact_value(result))
+            return success_response(req_id, self.redact_reply(context, subject, result))
         error = upstream.get("error")
         if _is_error_object(error):
-            return error_response(req_id, _neutralize_error(redact_value(error)))
+            sanitized = self.redact_reply(context, subject, error)
+            return error_response(req_id, _neutralize_error(sanitized))
         raise upstream_failure()
+
+    def redact_reply(self, context: CallContext, subject: str, value: Any) -> Any:
+        """Outbound DLP; a redaction promotes the session to ``private_data``."""
+        sanitized, categories = redact_tracked(value)
+        if categories:
+            self.firewall.taint_session(context.session_id, subject, PRIVATE_DATA)
+        return sanitized

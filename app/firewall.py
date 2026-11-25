@@ -32,6 +32,16 @@ from app.schemas import (
     Decision,
     MCPInspectionResponse,
     MCPToolCallRequest,
+    PolicyDocument,
+    TaintLabel,
+)
+from app.taint import (
+    TOXIC_FLOW_VIOLATION,
+    SessionTaintTracker,
+    TaintCall,
+    TaintVerdict,
+    classify,
+    evaluate_flow,
 )
 
 __all__ = [
@@ -129,8 +139,9 @@ class MCPFirewall:
         self,
         db_path: str | None = None,
         policy_engine: PolicyEngine | None = None,
+        taint: SessionTaintTracker | None = None,
     ) -> None:
-        """Initialize SQLite audit ledger and the RBAC policy engine.
+        """Initialize SQLite audit ledger, RBAC policy engine, and taint tracker.
 
         Without an explicit engine the startup policy is built fail-closed:
         ``AEGIS_ENVIRONMENT=prod`` with no valid policy denies every call.
@@ -139,22 +150,26 @@ class MCPFirewall:
         self.policy_engine = policy_engine or build_policy_engine(
             settings.policy_path, settings.environment
         )
+        self.taint = taint or SessionTaintTracker(
+            settings.mcp_session_ttl_seconds, settings.mcp_max_sessions
+        )
         self.ledger = AuditLedger(self.db_path, wal=settings.ledger_wal)
         self._init_db()
 
     def _apply_policy(
         self,
+        snapshot: tuple[PolicyDocument, str, bool],
         request: MCPToolCallRequest,
         violations: list[str],
         constraint_arguments: dict[str, Any] | None,
-    ) -> tuple[bool, str]:
+    ) -> bool:
         """Evaluate RBAC and argument ABAC against one atomic policy snapshot.
 
         Appends ``rbac_policy_denied`` (plus ``policy_fail_closed`` under the
         startup deny-all fallback) and any ``argument_*`` constraint codes;
-        returns ``(denied, policy_version)``.
+        returns True if the call is denied.
         """
-        document, version, fail_closed = self.policy_engine.snapshot()
+        document, _, fail_closed = snapshot
         scope = (
             request.agent_id,
             request.server_name,
@@ -171,7 +186,40 @@ class MCPFirewall:
         )
         argument_violations = evaluate_constraints(document, scope, subject)
         violations.extend(argument_violations)
-        return rbac_denied or bool(argument_violations), version
+        return rbac_denied or bool(argument_violations)
+
+    def _taint_flow(
+        self,
+        document: PolicyDocument,
+        request: MCPToolCallRequest,
+        session_id: str,
+        redacted: bool,
+    ) -> TaintVerdict:
+        """Evaluate the call against the session's toxic-flow taint state."""
+        if not settings.enable_taint_tracking:
+            return TaintVerdict(toxic=False, carried=frozenset())
+        call = TaintCall(
+            request.server_name,
+            request.tool_name,
+            request.environment,
+            request.arguments,
+        )
+        roles = classify(document, call, settings.taint_default_heuristics)
+        return evaluate_flow(self.taint.labels(session_id), roles, call, redacted)
+
+    def taint_session(
+        self, session_id: str, subject: str, labels: frozenset[TaintLabel]
+    ) -> None:
+        """Attach taint labels to a session (e.g. outbound DLP promotion)."""
+        if settings.enable_taint_tracking:
+            self.taint.record(session_id, subject, labels)
+
+    @staticmethod
+    def _redact(arguments: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        """Inbound DLP: ``(sanitized_arguments, redacted_categories)``."""
+        if not settings.enable_dlp_redaction:
+            return dict(arguments), []
+        return redact_payload(arguments)
 
     @staticmethod
     def _decide(
@@ -207,31 +255,42 @@ class MCPFirewall:
         rules and DLP always scan the full ``request.arguments``.
         ``denials`` are gateway-level violations (e.g. ``tool_definition_drift``)
         that deny the call exactly like an RBAC denial. ``session_id`` (the
-        gateway ``Mcp-Session-Id``) and the JCS digest of the sanitized
-        arguments are bound into the v2 ledger hash.
+        gateway ``Mcp-Session-Id``, else ``request.session_id``) and the JCS
+        digest of the sanitized arguments are bound into the v2 ledger hash.
+
+        Session-bound calls run toxic-flow taint analysis: an egress sink in
+        a session holding both ``untrusted_content`` and ``private_data`` is
+        denied with ``toxic_flow_exfiltration``; an allowed call adds its own
+        taint labels to the session.
         """
+        session_id = session_id or request.session_id
         raw_serialized = json.dumps(
             request.arguments, sort_keys=True, ensure_ascii=False
         )
         risk_score, violations = evaluate_threats(raw_serialized)
         violations.extend(denials)
-        policy_denied, version = self._apply_policy(
-            request, violations, constraint_arguments
+        snapshot = self.policy_engine.snapshot()
+        version = snapshot[1]
+        policy_denied = self._apply_policy(
+            snapshot, request, violations, constraint_arguments
         )
-        policy_denied = policy_denied or bool(denials)
-        if policy_denied:
+        sanitized_args, redacted_categories = self._redact(request.arguments)
+        flow = self._taint_flow(
+            snapshot[0], request, session_id, bool(redacted_categories)
+        )
+        if flow.toxic:
+            violations.append(TOXIC_FLOW_VIOLATION)
+        if policy_denied or denials or flow.toxic:
+            policy_denied = True
             risk_score = RBAC_RISK_SCORE
-
-        sanitized_args: dict[str, Any] = dict(request.arguments)
-        redacted_categories: list[str] = []
-        if settings.enable_dlp_redaction:
-            sanitized_args, redacted_categories = redact_payload(request.arguments)
-            if redacted_categories and risk_score < 25:
-                risk_score = 25
+        elif redacted_categories:
+            risk_score = max(risk_score, 25)
 
         allowed, decision, would_block = self._decide(
             risk_score, policy_denied, bool(redacted_categories)
         )
+        if allowed:
+            self.taint_session(session_id, request.tool_name, flow.carried)
         record = LedgerRecord(
             agent_id=request.agent_id,
             server_name=request.server_name,
@@ -316,5 +375,6 @@ class MCPFirewall:
         """Graceful shutdown hook (connections are per-operation)."""
 
     def reset(self) -> None:
-        """Clear audit ledger table for deterministic test isolation."""
+        """Clear audit ledger and session taint for deterministic isolation."""
         self.ledger.reset()
+        self.taint.reset()
