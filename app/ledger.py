@@ -586,6 +586,20 @@ class AuditLedger:
                 rows = conn.execute(LEDGER_SELECT + " ORDER BY id ASC").fetchall()
         return [_row_to_entry(row) for row in rows]
 
+    def count(self) -> int:
+        """Return the number of persisted ledger rows."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM audit_ledger").fetchone()
+        return int(row[0])
+
+    def list_recent(self, limit: int) -> list[AuditEntry]:
+        """Return the newest ``limit`` entries, newest first (bounded read)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                LEDGER_SELECT + " ORDER BY id DESC LIMIT ?", (max(1, limit),)
+            ).fetchall()
+        return [_row_to_entry(row) for row in rows]
+
     def verify(self) -> ChainVerificationResponse:
         """Verify every link (v1 legacy and v2 full-payload) of the chain."""
         entries = self.list_entries()

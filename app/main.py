@@ -18,8 +18,9 @@ from fastapi import (
     Security,
     status,
 )
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
 from opentelemetry.util.types import AttributeValue
 from starlette.concurrency import run_in_threadpool
 
@@ -35,6 +36,7 @@ from app.auth import (
     Principal,
     build_resource_server,
 )
+from app.cockpit import STATIC_DIR, cockpit_response
 from app.config import settings
 from app.firewall import MCPFirewall
 from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
@@ -47,6 +49,7 @@ from app.schemas import (
     ApprovalStatus,
     AuditEntry,
     ChainVerificationResponse,
+    CockpitSummary,
     HitlApproval,
     InclusionProofResponse,
     MCPInspectionResponse,
@@ -101,6 +104,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.add_middleware(ObservabilityMiddleware)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+AUDIT_FEED_MAX_LIMIT = 500
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -170,6 +176,44 @@ def require_admin_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key authentication header.",
         )
+
+
+@app.get("/", tags=["Cockpit"], response_class=HTMLResponse, include_in_schema=False)
+def security_cockpit() -> HTMLResponse:
+    """Serve the operator Security & Audit Chain Inspector cockpit."""
+    return cockpit_response()
+
+
+@app.get(
+    "/api/v1/cockpit/summary",
+    response_model=CockpitSummary,
+    dependencies=[Depends(authenticate)],
+    tags=["Cockpit"],
+)
+def get_cockpit_summary() -> CockpitSummary:
+    """Return security-posture KPIs (counters, policy mode, rate anomalies)."""
+    snapshot = metrics_registry.snapshot()
+    totals = snapshot["totals"]
+    _, version, fail_closed = policy_engine.snapshot()
+    return CockpitSummary(
+        requests_total=totals["requests"],
+        decisions=snapshot["decisions"],
+        blocked_rule_hits=totals["blocked_rules"],
+        redactions_total=totals["redactions"],
+        redactions=snapshot["redactions"],
+        shadow_would_block=totals["shadow_would_block"],
+        rate_anomalies_total=totals["rate_anomalies"],
+        rate_anomalies=snapshot["rate_anomalies"],
+        ledger_errors=totals["ledger_errors"],
+        ledger_entries=firewall.ledger.count(),
+        policy_mode=settings.policy_mode,
+        policy_version=version,
+        environment=settings.environment,
+        fail_closed=fail_closed,
+        rate_limit_enabled=settings.rate_limit_enabled,
+        auth_mode=settings.auth_mode,
+        api_key_required=settings.api_key is not None,
+    )
 
 
 @app.get("/healthz", tags=["Health"])
@@ -247,6 +291,19 @@ def inspect_mcp_tool_call(
 def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
     """Return the tamper-evident audit ledger entries."""
     return firewall.list_audit_entries(agent_id=agent_id)
+
+
+@app.get(
+    "/api/v1/audit/entries",
+    response_model=list[AuditEntry],
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+)
+def list_recent_audit_entries(
+    limit: Annotated[int, Query(ge=1, le=AUDIT_FEED_MAX_LIMIT)] = 50,
+) -> list[AuditEntry]:
+    """Return the newest ``limit`` ledger entries, newest first (read-only)."""
+    return firewall.ledger.list_recent(limit)
 
 
 @app.get(

@@ -517,6 +517,38 @@ class RateLimitStats(BaseModel):
     velocity_anomalies_total: int = Field(..., description="Velocity anomalies.")
 
 
+class CockpitSummary(BaseModel):
+    """Security posture KPIs rendered by the operator cockpit (``GET /``)."""
+
+    requests_total: int = Field(..., ge=0, description="Inspected MCP calls.")
+    decisions: dict[str, int] = Field(
+        default_factory=dict, description="Inspected calls per firewall decision."
+    )
+    blocked_rule_hits: int = Field(..., ge=0, description="Blocking rule matches.")
+    redactions_total: int = Field(..., ge=0, description="DLP redactions applied.")
+    redactions: dict[str, int] = Field(
+        default_factory=dict, description="DLP redactions per category."
+    )
+    shadow_would_block: int = Field(
+        ..., ge=0, description="Monitor-mode calls enforce mode would block."
+    )
+    rate_anomalies_total: int = Field(..., ge=0, description="Rate anomalies.")
+    rate_anomalies: dict[str, int] = Field(
+        default_factory=dict, description="Rate anomalies per kind."
+    )
+    ledger_errors: int = Field(..., ge=0, description="Ledger integrity failures.")
+    ledger_entries: int = Field(..., ge=0, description="Persisted ledger rows.")
+    policy_mode: PolicyMode = Field(..., description="enforce|monitor.")
+    policy_version: str = Field(..., description="SHA-256 of the active policy.")
+    environment: Environment = Field(..., description="Gateway deployment env.")
+    fail_closed: bool = Field(..., description="Startup deny-all fallback active.")
+    rate_limit_enabled: bool = Field(..., description="AEGIS_RATE_LIMIT_ENABLED.")
+    auth_mode: str = Field(..., description="api_key|oauth.")
+    api_key_required: bool = Field(
+        ..., description="True when AEGIS_API_KEY is configured."
+    )
+
+
 class SessionTaintStatus(BaseModel):
     """Toxic-flow taint state of one agent session (observability)."""
 

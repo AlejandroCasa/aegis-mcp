@@ -127,6 +127,15 @@ class Histogram:
         self._sums.clear()
 
 
+def _sum_by(counter: Counter[Hashable], position: int) -> dict[str, int]:
+    """Aggregate a tuple-keyed counter by one label position."""
+    totals: Counter[str] = Counter()
+    for key, count in counter.items():
+        label = key[position] if isinstance(key, tuple) else key
+        totals[str(label)] += count
+    return dict(totals)
+
+
 class MetricsRegistry:
     """Thread-safe in-memory metrics registry for Prometheus 0.0.4 exposition."""
 
@@ -256,6 +265,33 @@ class MetricsRegistry:
                 "",
             ]
             return "\n".join(lines)
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        """Return aggregated counter totals for the operator cockpit.
+
+        Keys: ``decisions`` (requests per decision), ``redactions`` (per DLP
+        category), ``rate_anomalies`` (per anomaly kind) and ``totals``.
+        """
+        with self._lock:
+            decisions = _sum_by(self._requests_total, 1)
+            anomalies = _sum_by(self._rate_anomalies_total, 0)
+            redactions = {
+                str(key): count for key, count in self._redactions_total.items()
+            }
+            totals = {
+                "requests": sum(decisions.values()),
+                "blocked_rules": sum(self._blocked_total.values()),
+                "redactions": sum(redactions.values()),
+                "shadow_would_block": sum(self._shadow_total.values()),
+                "rate_anomalies": sum(anomalies.values()),
+                "ledger_errors": sum(self._ledger_errors_total.values()),
+            }
+        return {
+            "decisions": decisions,
+            "redactions": redactions,
+            "rate_anomalies": anomalies,
+            "totals": totals,
+        }
 
     def reset(self) -> None:
         """Clear all metric series and label limiters for test isolation."""
