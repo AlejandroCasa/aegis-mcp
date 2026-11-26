@@ -82,6 +82,17 @@ class Settings(BaseSettings):
     # block the single chain writer).
     ledger_wal: bool = True
 
+    # RFC 6962 Merkle checkpoints: every ``checkpoint_interval`` appended
+    # events (0 = only on demand) the ledger signs an Ed25519 Signed Tree
+    # Head with the PKCS#8 PEM key at ``signing_key_path``. Without a key,
+    # ``prod`` fails closed at startup unless ``checkpoint_signing`` is
+    # disabled; elsewhere ``signing_key_ephemeral`` opts into a throwaway
+    # in-memory key (dev/test only), otherwise checkpoints are disabled.
+    checkpoint_signing: bool = True
+    checkpoint_interval: int = Field(default=50, ge=0)
+    signing_key_path: str | None = None
+    signing_key_ephemeral: bool = False
+
     # Authentication: ``api_key`` (local development, X-API-Key + self-declared
     # X-Aegis-Agent-Id) or ``oauth`` (OAuth 2.1 resource server, identity from
     # validated JWT claims only).

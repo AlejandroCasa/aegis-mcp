@@ -206,6 +206,43 @@ class ChainVerificationResponse(BaseModel):
     )
 
 
+class SignedCheckpoint(BaseModel):
+    """Ed25519 Signed Tree Head over the RFC 6962 Merkle tree of the ledger."""
+
+    tree_size: int = Field(..., ge=0, description="Entries committed to.")
+    root_hash: str = Field(..., description="RFC 6962 Merkle Tree Hash (hex).")
+    timestamp: str = Field(..., description="ISO-8601 UTC signing time.")
+    prev_checkpoint_hash: str = Field(
+        ..., description="Checkpoint hash of the previous tree head (hex)."
+    )
+    checkpoint_hash: str = Field(
+        ..., description="SHA-256 of the signed canonical tree head (hex)."
+    )
+    algorithm: Literal["Ed25519"] = "Ed25519"
+    signature: str = Field(..., description="Ed25519 signature (hex).")
+    public_key: str = Field(..., description="Raw Ed25519 public key (hex).")
+    key_fingerprint: str = Field(
+        ..., description="SHA-256 fingerprint of the public key (hex)."
+    )
+
+
+class InclusionProofResponse(BaseModel):
+    """RFC 6962 Merkle inclusion proof of one audit ledger entry."""
+
+    entry_id: int = Field(..., description="Ledger entry ID.")
+    leaf_index: int = Field(..., ge=0, description="0-based Merkle leaf index.")
+    tree_size: int = Field(..., ge=1, description="Size of the proven tree.")
+    entry_hash: str = Field(..., description="Entry hash used as Merkle leaf.")
+    root_hash: str = Field(..., description="Merkle Tree Hash the proof targets.")
+    audit_path: list[str] = Field(
+        default_factory=list, description="Sibling hashes, leaf to root (hex)."
+    )
+    checkpoint: SignedCheckpoint | None = Field(
+        default=None,
+        description="Signed Tree Head of ``tree_size`` (absent when unsigned).",
+    )
+
+
 class PolicyRule(BaseModel):
     """A single RBAC matrix row scoped by agent, server, and environment.
 

@@ -37,7 +37,9 @@ from app.auth import (
 from app.config import settings
 from app.firewall import MCPFirewall
 from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
+from app.merkle import SignedTreeHead
 from app.metrics import metrics_registry
+from app.ocsf import NDJSON_MEDIA_TYPE, ocsf_lines
 from app.policy import build_policy_engine
 from app.schemas import (
     ApprovalResolution,
@@ -45,11 +47,13 @@ from app.schemas import (
     AuditEntry,
     ChainVerificationResponse,
     HitlApproval,
+    InclusionProofResponse,
     MCPInspectionResponse,
     MCPToolCallRequest,
     PolicyDocument,
     PolicyStatus,
     SessionTaintStatus,
+    SignedCheckpoint,
     ToolApproval,
     ToolPin,
 )
@@ -239,6 +243,104 @@ def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
 def verify_audit_chain() -> ChainVerificationResponse:
     """Verify the cryptographic integrity of the SHA-256 hash chain."""
     return firewall.verify_chain()
+
+
+def _checkpoint_model(checkpoint: SignedTreeHead) -> SignedCheckpoint:
+    """API representation of a Signed Tree Head."""
+    return SignedCheckpoint(**checkpoint.as_dict())
+
+
+@app.get(
+    "/api/v1/audit/proof/{entry_id}",
+    response_model=InclusionProofResponse,
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+    responses={404: {"description": "Ledger entry not found."}},
+)
+def get_inclusion_proof(
+    entry_id: Annotated[int, Path(ge=1)],
+) -> InclusionProofResponse:
+    """Return an RFC 6962 Merkle inclusion proof for one ledger entry.
+
+    The proof targets the latest Ed25519 Signed Tree Head (signed on demand
+    when it does not cover the entry yet and a signing key is configured).
+    """
+    bundle = firewall.ledger.inclusion_proof(entry_id)
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ledger entry not found.",
+        )
+    return InclusionProofResponse(
+        entry_id=bundle.entry_id,
+        leaf_index=bundle.leaf_index,
+        tree_size=bundle.tree_size,
+        entry_hash=bundle.entry_hash,
+        root_hash=bundle.root_hash,
+        audit_path=bundle.audit_path,
+        checkpoint=(
+            _checkpoint_model(bundle.checkpoint) if bundle.checkpoint else None
+        ),
+    )
+
+
+@app.get(
+    "/api/v1/audit/checkpoints",
+    response_model=list[SignedCheckpoint],
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+)
+def list_checkpoints() -> list[SignedCheckpoint]:
+    """Return every Ed25519 Signed Tree Head (oldest first)."""
+    return [_checkpoint_model(item) for item in firewall.ledger.list_checkpoints()]
+
+
+@app.post(
+    "/api/v1/audit/checkpoints",
+    response_model=SignedCheckpoint,
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["Audit Ledger"],
+    responses={409: {"description": "Checkpoint signing is not configured."}},
+)
+def create_checkpoint() -> SignedCheckpoint:
+    """Manually sign a checkpoint over the current ledger tree."""
+    checkpoint = firewall.ledger.create_checkpoint()
+    if checkpoint is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Checkpoint signing is not configured.",
+        )
+    return _checkpoint_model(checkpoint)
+
+
+@app.get(
+    "/api/v1/audit/export/ocsf",
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {NDJSON_MEDIA_TYPE: {}},
+            "description": "OCSF 1.3.0 API Activity events as JSON Lines.",
+        }
+    },
+)
+def export_ocsf(agent_id: str | None = None) -> StreamingResponse:
+    """Export ledger events as OCSF JSON Lines for SIEM ingestion.
+
+    Each event carries hash-chain/Merkle integrity evidence and EU AI Act
+    Art. 12 / ISO/IEC 42001 A.6.2.8 record-keeping metadata.
+    """
+    lines = ocsf_lines(
+        firewall.list_audit_entries(),
+        firewall.ledger.list_checkpoints(),
+        agent_id,
+    )
+    return StreamingResponse(
+        lines,
+        media_type=NDJSON_MEDIA_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="aegis-ocsf.jsonl"'},
+    )
 
 
 @app.get(

@@ -26,6 +26,7 @@ from app.ledger import (
     compute_entry_hash_v2,
     digest_arguments,
 )
+from app.merkle import load_signer
 from app.normalize import detection_views
 from app.policy import (
     FAIL_CLOSED_VIOLATION,
@@ -159,7 +160,9 @@ class MCPFirewall:
 
         Without an explicit engine the startup policy is built fail-closed:
         ``AEGIS_ENVIRONMENT=prod`` with no valid policy denies every call.
-        An invalid ``AEGIS_WEBHOOK_URL`` raises ``WebhookConfigError``.
+        An invalid ``AEGIS_WEBHOOK_URL`` raises ``WebhookConfigError``; a
+        missing/invalid checkpoint signing key in prod raises
+        ``SigningKeyError`` (fail-closed).
         """
         self.db_path = db_path or settings.db_path
         self.policy_engine = policy_engine or build_policy_engine(
@@ -168,7 +171,17 @@ class MCPFirewall:
         self.taint = taint or SessionTaintTracker(
             settings.mcp_session_ttl_seconds, settings.mcp_max_sessions
         )
-        self.ledger = AuditLedger(self.db_path, wal=settings.ledger_wal)
+        self.ledger = AuditLedger(
+            self.db_path,
+            wal=settings.ledger_wal,
+            signer=load_signer(
+                settings.checkpoint_signing,
+                settings.signing_key_path,
+                settings.signing_key_ephemeral,
+                settings.environment,
+            ),
+            checkpoint_interval=settings.checkpoint_interval,
+        )
         self._init_db()
         self.approvals = approvals or ApprovalQueue(
             self.db_path, settings.hitl_timeout_seconds
