@@ -1,0 +1,87 @@
+# Aegis-MCP SLO and security alerts (prometheus-operator PrometheusRule).
+# Metrics are exported by the gateway at /metrics; all labels are bounded
+# (no agent_id / session_id), see app/metrics.py.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aegis-mcp
+  labels:
+    app: aegis-mcp
+    app.kubernetes.io/name: aegis-mcp
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+    - name: aegis-mcp.slo
+      rules:
+        - record: aegis_mcp:inspection_duration_seconds:p99_5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(aegis_mcp_inspection_duration_seconds_bucket[5m])))
+        - alert: AegisMcpInspectionLatencyP99High
+          expr: aegis_mcp:inspection_duration_seconds:p99_5m > 0.01
+          for: 10m
+          labels:
+            severity: warning
+            slo: inspection-latency
+          annotations:
+            summary: Aegis-MCP inspection p99 latency above the 10ms SLO
+            description: >-
+              p99 firewall inspection latency is {{ $value | humanizeDuration }}
+              over the last 5 minutes (SLO: 10ms).
+    - name: aegis-mcp.security
+      rules:
+        - alert: AegisMcpToxicFlowExfiltrationSpike
+          expr: sum(increase(aegis_mcp_blocked_total{rule="toxic_flow_exfiltration"}[10m])) > 5
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: Elevated toxic-flow (lethal trifecta) exfiltration attempts
+            description: >-
+              {{ $value | humanize }} toxic_flow_exfiltration denials in the last
+              10 minutes; review tainted sessions and egress tools.
+        - alert: AegisMcpToolDefinitionDrift
+          expr: sum(increase(aegis_mcp_blocked_total{rule="tool_definition_drift"}[15m])) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: MCP tool definition drift detected (possible rug pull)
+            description: >-
+              {{ $value | humanize }} calls hit drifted tool definitions in the
+              last 15 minutes; re-approve or quarantine the upstream server.
+        - alert: AegisMcpBlockRateHigh
+          expr: |
+            sum(rate(aegis_mcp_requests_total{decision="BLOCKED"}[10m]))
+              / clamp_min(sum(rate(aegis_mcp_requests_total[10m])), 1e-9) > 0.25
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: More than 25% of MCP tool calls are being blocked
+            description: >-
+              Block ratio is {{ $value | humanizePercentage }}; check for an
+              attack in progress or a bad policy rollout.
+    - name: aegis-mcp.ledger
+      rules:
+        - alert: AegisMcpAuditChainTampered
+          expr: increase(aegis_mcp_ledger_errors_total{kind="chain_tampered"}[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: Aegis-MCP audit hash chain verification failed
+            description: >-
+              The tamper-evident audit ledger failed verification; preserve the
+              database and investigate immediately.
+        - alert: AegisMcpCheckpointSigningErrors
+          expr: increase(aegis_mcp_ledger_errors_total{kind="checkpoint_error"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: Aegis-MCP Merkle checkpoint signing is failing
+            description: >-
+              Signed Tree Head creation failed {{ $value | humanize }} times in
+              the last 15 minutes; check the Ed25519 signing key and ledger.

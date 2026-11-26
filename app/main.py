@@ -20,6 +20,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
+from opentelemetry.util.types import AttributeValue
 from starlette.concurrency import run_in_threadpool
 
 from app.approvals import (
@@ -58,9 +59,19 @@ from app.schemas import (
     ToolPin,
 )
 from app.streamable import StreamableHttpTransport, TransportReply
+from app.telemetry import (
+    ObservabilityMiddleware,
+    configure_logging,
+    get_tracer,
+    mcp_attributes,
+    setup_tracing,
+)
 from app.toolguard import FingerprintMismatchError, PinNotFoundError
 
 logger = logging.getLogger("aegis_mcp.policy")
+
+configure_logging(settings.log_format)
+tracer_provider = setup_tracing(settings)
 
 policy_engine = build_policy_engine(settings.policy_path, settings.environment)
 firewall = MCPFirewall(policy_engine=policy_engine)
@@ -71,10 +82,12 @@ resource_server = build_resource_server(settings.auth_mode, settings.oauth_confi
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
-    """Manage application startup and graceful SQLite draining on shutdown."""
+    """Manage startup, graceful SQLite draining and span flushing on shutdown."""
     firewall._init_db()
     yield
     firewall.close()
+    if tracer_provider is not None:
+        tracer_provider.shutdown()
 
 
 app = FastAPI(
@@ -86,6 +99,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.add_middleware(ObservabilityMiddleware)
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -555,7 +569,13 @@ async def mcp_jsonrpc_proxy(
         "environment": x_aegis_environment,
         "session_id": x_aegis_session_id,
     }
-    payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
+    with get_tracer().start_as_current_span(
+        "mcp.proxy jsonrpc",
+        attributes=mcp_attributes(
+            x_aegis_mcp_server, x_aegis_session_id, **{"network.transport": "http"}
+        ),
+    ):
+        payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
     return JSONResponse(payload)
 
 
@@ -569,6 +589,19 @@ def mcp_routing(principal: Principal | None, request: Request) -> dict[str, str 
         "server_name": headers.get("x-aegis-mcp-server"),
         "environment": headers.get("x-aegis-environment"),
     }
+
+
+def streamable_span_attributes(request: Request) -> dict[str, AttributeValue]:
+    """GenAI/MCP attributes of one Streamable HTTP exchange."""
+    headers = request.headers
+    return mcp_attributes(
+        headers.get("x-aegis-mcp-server"),
+        headers.get("mcp-session-id"),
+        **{
+            "network.transport": "http",
+            "mcp.protocol.version": headers.get("mcp-protocol-version"),
+        },
+    )
 
 
 def transport_response(reply: TransportReply) -> Response:
@@ -591,9 +624,12 @@ async def mcp_streamable_post(
 ) -> Response:
     """MCP Streamable HTTP: send JSON-RPC messages (JSON or SSE replies)."""
     raw = await read_body_capped(request, MAX_REQUEST_BYTES)
-    reply = await run_in_threadpool(
-        mcp_transport.post, request.headers, raw, mcp_routing(principal, request)
-    )
+    with get_tracer().start_as_current_span(
+        "mcp.streamable_http POST", attributes=streamable_span_attributes(request)
+    ):
+        reply = await run_in_threadpool(
+            mcp_transport.post, request.headers, raw, mcp_routing(principal, request)
+        )
     return transport_response(reply)
 
 
@@ -602,9 +638,12 @@ async def mcp_streamable_get(
     request: Request, principal: AuthenticatedPrincipal
 ) -> Response:
     """MCP Streamable HTTP: open the server-initiated SSE stream."""
-    reply = await run_in_threadpool(
-        mcp_transport.get, request.headers, mcp_routing(principal, request)
-    )
+    with get_tracer().start_as_current_span(
+        "mcp.streamable_http GET", attributes=streamable_span_attributes(request)
+    ):
+        reply = await run_in_threadpool(
+            mcp_transport.get, request.headers, mcp_routing(principal, request)
+        )
     return transport_response(reply)
 
 
@@ -613,7 +652,10 @@ async def mcp_streamable_delete(
     request: Request, principal: AuthenticatedPrincipal
 ) -> Response:
     """MCP Streamable HTTP: terminate the session."""
-    reply = await run_in_threadpool(
-        mcp_transport.delete, request.headers, mcp_routing(principal, request)
-    )
+    with get_tracer().start_as_current_span(
+        "mcp.streamable_http DELETE", attributes=streamable_span_attributes(request)
+    ):
+        reply = await run_in_threadpool(
+            mcp_transport.delete, request.headers, mcp_routing(principal, request)
+        )
     return transport_response(reply)

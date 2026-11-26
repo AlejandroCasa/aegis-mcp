@@ -1,9 +1,11 @@
 """Zero-Trust MCP Firewall and SHA-256 hash-chained SQLite audit ledger."""
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any
 
 from app.approvals import (
@@ -27,6 +29,7 @@ from app.ledger import (
     digest_arguments,
 )
 from app.merkle import load_signer
+from app.metrics import metrics_registry
 from app.normalize import detection_views
 from app.policy import (
     FAIL_CLOSED_VIOLATION,
@@ -55,6 +58,7 @@ from app.taint import (
     classify,
     evaluate_flow,
 )
+from app.telemetry import decision_attributes, get_tracer, mcp_attributes
 from app.webhooks import Incident, WebhookDispatcher
 
 __all__ = [
@@ -65,6 +69,8 @@ __all__ = [
     "compute_entry_hash_v2",
     "evaluate_threats",
 ]
+
+logger = logging.getLogger("aegis_mcp.inspection")
 
 OBFUSCATION_VIOLATION = "obfuscated_payload"
 DECODE_BUDGET_VIOLATION = "decode_budget_exceeded"
@@ -343,6 +349,51 @@ class MCPFirewall:
         denials: Sequence[str] = (),
         session_id: str = "",
     ) -> MCPInspectionResponse:
+        """Inspect an MCP tool call inside an ``aegis.firewall.inspect`` span.
+
+        See ``_evaluate`` for the inspection semantics. The span carries the
+        GenAI/MCP attributes and verdict; the latency is observed in the
+        ``aegis_mcp_inspection_duration_seconds`` SLO histogram and one
+        structured (DLP-scrubbed) ``mcp.inspection`` log line is emitted.
+        """
+        session_id = session_id or request.session_id
+        start = perf_counter()
+        with get_tracer().start_as_current_span(
+            "aegis.firewall.inspect",
+            attributes=mcp_attributes(request.server_name, session_id),
+        ) as span:
+            report = self._evaluate(request, constraint_arguments, denials, session_id)
+            span.set_attributes(
+                decision_attributes(
+                    request.tool_name,
+                    report.decision,
+                    report.risk_score,
+                    report.violations,
+                )
+            )
+            elapsed = perf_counter() - start
+            metrics_registry.observe_inspection(report.decision, elapsed)
+            logger.info(
+                "mcp tool call inspected",
+                extra={
+                    "event": "mcp.inspection",
+                    "decision": report.decision,
+                    "risk_score": report.risk_score,
+                    "violations": report.violations,
+                    "server_name": request.server_name,
+                    "tool_name": request.tool_name,
+                    "duration_ms": round(elapsed * 1000, 3),
+                },
+            )
+        return report
+
+    def _evaluate(
+        self,
+        request: MCPToolCallRequest,
+        constraint_arguments: dict[str, Any] | None,
+        denials: Sequence[str],
+        session_id: str,
+    ) -> MCPInspectionResponse:
         """Inspect an MCP tool call, redact PII/secrets, and append to hash ledger.
 
         ``constraint_arguments`` selects the object argument constraints apply
@@ -359,7 +410,6 @@ class MCPFirewall:
         denied with ``toxic_flow_exfiltration``; an allowed call adds its own
         taint labels to the session.
         """
-        session_id = session_id or request.session_id
         raw_serialized = json.dumps(
             request.arguments, sort_keys=True, ensure_ascii=False
         )
@@ -520,8 +570,19 @@ class MCPFirewall:
         return self.ledger.list_entries(agent_id)
 
     def verify_chain(self) -> ChainVerificationResponse:
-        """Verify every link (legacy v1 and full-payload v2) of the ledger."""
-        return self.ledger.verify()
+        """Verify every link (legacy v1 and full-payload v2) of the ledger.
+
+        A broken chain increments ``aegis_mcp_ledger_errors_total``
+        (``kind="chain_tampered"``) for alerting.
+        """
+        result = self.ledger.verify()
+        if not result.valid:
+            metrics_registry.record_ledger_error("chain_tampered")
+            logger.error(
+                "audit chain verification failed",
+                extra={"event": "ledger.chain_tampered"},
+            )
+        return result
 
     def close(self) -> None:
         """Graceful shutdown: drain and stop the webhook worker pool."""

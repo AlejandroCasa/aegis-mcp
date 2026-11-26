@@ -48,6 +48,7 @@ from app.schemas import (
     MCPToolCallRequest,
     TaintLabel,
 )
+from app.telemetry import annotate_current_span, decision_attributes
 from app.toolguard import (
     DRIFT_VIOLATION,
     LIST_METHODS,
@@ -528,6 +529,14 @@ class JsonRpcGateway:
             violations=report.violations,
             redacted_categories=report.redacted_categories,
             would_block=report.would_block,
+        )
+        annotate_current_span(
+            {
+                "mcp.method.name": method,
+                **decision_attributes(
+                    tool_name, report.decision, report.risk_score, report.violations
+                ),
+            }
         )
         if not report.allowed:
             raise JsonRpcError(

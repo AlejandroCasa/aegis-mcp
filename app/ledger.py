@@ -51,6 +51,7 @@ from app.merkle import (
     inclusion_proof,
     merkle_root,
 )
+from app.metrics import metrics_registry
 from app.schemas import AuditEntry, ChainVerificationResponse, Decision, PolicyMode
 
 GENESIS_HASH = "0" * 64
@@ -452,6 +453,16 @@ class AuditLedger:
         return _row_to_checkpoint(row) if row else None
 
     def _sign_checkpoint(
+        self, conn: sqlite3.Connection, signer: CheckpointSigner
+    ) -> SignedTreeHead:
+        """Sign a checkpoint; failures count as ``checkpoint_error`` and re-raise."""
+        try:
+            return self._sign_tree_head(conn, signer)
+        except Exception:
+            metrics_registry.record_ledger_error("checkpoint_error")
+            raise
+
+    def _sign_tree_head(
         self, conn: sqlite3.Connection, signer: CheckpointSigner
     ) -> SignedTreeHead:
         """Sign a Signed Tree Head over every entry (caller holds the lock)."""

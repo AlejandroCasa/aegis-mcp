@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -105,6 +106,21 @@ class Settings(BaseSettings):
     oauth_scopes_supported: list[str] = Field(default_factory=list)
     oauth_leeway_seconds: int = 30
     oauth_jwks_cache_seconds: int = 300
+
+    # Observability: OpenTelemetry traces are exported over OTLP/HTTP when
+    # ``otel_enabled`` is true; left unset it follows ``otel_endpoint`` (off
+    # in dev/test, on as soon as a collector endpoint is configured). Logs of
+    # the ``aegis_mcp`` namespace are DLP-scrubbed ``json`` lines or ``text``.
+    otel_enabled: bool | None = None
+    otel_endpoint: str | None = None
+    otel_service_name: str = "aegis-mcp"
+    log_format: Literal["json", "text"] = "json"
+
+    def otel_active(self) -> bool:
+        """Effective tracing switch (explicit flag, else endpoint presence)."""
+        if self.otel_enabled is not None:
+            return self.otel_enabled
+        return bool(self.otel_endpoint)
 
     def oauth_config(self) -> OAuthConfig:
         """Build the validated OAuth config (raises ValueError when incomplete)."""

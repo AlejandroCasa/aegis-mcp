@@ -25,7 +25,9 @@ Aegis-MCP sits between AI Agents (Claude Desktop, Cursor, autonomous orchestrato
   - Each record (hash v2, [`app/ledger.py`](app/ledger.py)) computes `entry_hash` as the SHA-256 of the RFC 8785 (JCS) canonical JSON of the **full** entry (`prev_hash`, timestamp, identity/scope, decision, risk score, violations, DLP categories, sanitized-arguments digest, policy version/mode, `would_block`, MCP session id), forming an immutable chain verifiable via `GET /api/v1/audit/verify`. Legacy v1 links (`SHA256(prev_hash | timestamp | agent_id | server_name | tool_name | decision | risk_score)`) are migrated additively and still verified; a v1 link after a v2 link is rejected as a downgrade.
 - **Anti-Evasion Canonicalization ([`app/normalize.py`](app/normalize.py))**: threat rules and DLP also run on NFKC-normalized, zero-width/bidi-stripped (CVE-2021-42574), tag-revealed, homoglyph-folded, percent/HTML-decoded and bounded recursive Base64/hex-decoded views; matches only visible after decoding add `obfuscated_payload`.
 - **Prometheus Observability (`GET /metrics`) & Perimeter Auth (`X-API-Key`)**:
-  - Zero-dependency Prometheus 0.0.4 text exposition tracking `aegis_mcp_requests_total`, `aegis_mcp_blocked_total`, and `aegis_mcp_redactions_total`.
+  - Zero-dependency Prometheus 0.0.4 text exposition tracking `aegis_mcp_requests_total`, `aegis_mcp_blocked_total`, `aegis_mcp_redactions_total`, `aegis_mcp_ledger_errors_total`, and the `aegis_mcp_inspection_duration_seconds` SLO histogram (1 ms–500 ms buckets around the 10 ms p99 objective). Label values are sanitized and capped at 64 per label (overflow → `other`); no `agent_id`/`session_id` labels.
+  - OpenTelemetry traces ([`app/telemetry.py`](app/telemetry.py)) over OTLP/HTTP with GenAI/MCP semantic conventions (`gen_ai.system`, `mcp.server.name`, `mcp.tool.name`, `mcp.method.name`, `aegis.decision`, `aegis.risk_score`, pseudonymized `aegis.session.id`) for the HTTP server span, the JSON-RPC proxy, `/mcp` Streamable HTTP and `MCPFirewall.inspect`; W3C `traceparent` is honored.
+  - DLP-scrubbed structured JSON logs with `trace_id`, `span_id`, `request_id` (`X-Request-Id`), `decision` and `risk_score`; Grafana dashboard [`deploy/grafana/aegis-mcp.json`](deploy/grafana/aegis-mcp.json) and `PrometheusRule` alerts [`deploy/prometheus/aegis-mcp-rules.yaml`](deploy/prometheus/aegis-mcp-rules.yaml) (p99 > 10 ms, toxic-flow / tool-drift spikes, chain/checkpoint errors).
 - **4-Phase Zero-Tolerance CI/CD & Container Hardening**:
   - Multi-stage [`Dockerfile`](Dockerfile) running under `UID 10001` (`appuser`) with Kubernetes manifests ([`k8s/`](k8s/)) and OPA/Rego policies ([`policy/`](policy/)).
 
@@ -44,6 +46,10 @@ Aegis-MCP sits between AI Agents (Claude Desktop, Cursor, autonomous orchestrato
 | `AEGIS_MCP_SESSION_TTL_SECONDS` / `AEGIS_MCP_MAX_SESSIONS` | `3600` / `10000` | Sliding idle lifetime and capacity (`503` when full) of `/mcp` sessions. |
 | `AEGIS_MCP_STREAM_TIMEOUT_SECONDS` | `300` | Wall-clock cap of one relayed SSE stream (and the upstream read timeout for streams). |
 | `AEGIS_LEDGER_WAL` | `true` | SQLite write-ahead logging for the audit ledger (readers never block the chain writer). |
+| `AEGIS_OTEL_ENABLED` | unset | Export OpenTelemetry traces over OTLP/HTTP. Unset follows `AEGIS_OTEL_ENDPOINT` (off in dev/test, on once an endpoint is configured). |
+| `AEGIS_OTEL_ENDPOINT` | unset | OTLP/HTTP collector base URL (e.g. `http://otel-collector:4318`; `/v1/traces` is appended). Without it, the standard `OTEL_EXPORTER_OTLP_*` variables apply. |
+| `AEGIS_OTEL_SERVICE_NAME` | `aegis-mcp` | `service.name` resource attribute of exported spans. |
+| `AEGIS_LOG_FORMAT` | `json` | `json` (one DLP-scrubbed object per line with `trace_id`/`span_id`/`request_id`) or `text`. |
 
 ### Native MCP Streamable HTTP (`POST`/`GET`/`DELETE /mcp`)
 
