@@ -95,6 +95,48 @@ docker build -t aegis-mcp:latest .
 docker run --rm -p 8000:8000 aegis-mcp:latest
 ```
 
+### Firewalling local `stdio` MCP servers (Claude Desktop / Cursor / Windsurf)
+
+`app.stdio_wrap` sits between a local MCP host and any `stdio` MCP server subprocess:
+
+```bash
+uv run python -m app.stdio_wrap [--server-name NAME] [--agent-id AGENT] \
+  [--environment dev|staging|prod] [--policy PATH] [--db-path PATH] -- <command> [args...]
+```
+
+Replace the server's `command`/`args` in your host's `mcpServers` config with the wrapper (use absolute paths; `--directory` points `uv` at this checkout):
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "uv",
+      "args": [
+        "run", "--directory", "/opt/aegis-mcp", "python", "-m", "app.stdio_wrap",
+        "--server-name", "filesystem-mcp", "--agent-id", "cursor",
+        "--policy", "/opt/aegis-mcp/policy/local.yaml",
+        "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/srv/workspace"
+      ]
+    },
+    "postgres": {
+      "command": "uv",
+      "args": [
+        "run", "--directory", "/opt/aegis-mcp", "python", "-m", "app.stdio_wrap",
+        "--server-name", "postgres-mcp", "--environment", "prod",
+        "--policy", "/opt/aegis-mcp/policy/local.yaml",
+        "--", "npx", "-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/app"
+      ]
+    }
+  }
+}
+```
+
+- **Framing**: UTF-8 newline-delimited JSON-RPC 2.0 on `stdin`/`stdout` (lines capped at `1 MiB` from the host and `5 MiB` from the server); the server's `stderr` and wrapper diagnostics go to `stderr` only.
+- **Inbound**: `tools/call`, `resources/read` and `prompts/get` run the full `MCPFirewall.inspect` pipeline (threat rules, RBAC, `tool_constraints`, toolguard drift/poisoning, toxic-flow taint, DLP, ledger). Blocked calls are **never forwarded** and are answered with `-32003` (`violations`, `audit_hash`). Discovery requests, `notifications/*` and client responses are DLP-redacted; other methods get `-32601`, client batches `-32600`.
+- **Outbound**: replies are matched to their pending request and toolguard-screened (`initialize` pinning, `*/list` TOFU pinning, drift hiding, poisoning hiding, RBAC least-privilege `tools/list`), DLP-redacted (a redaction promotes the session to `private_data` taint), and reserved codes `-32003`/`-32004` are rewritten to `-32000`. Server-initiated messages are DLP-redacted; unsolicited responses are dropped.
+- **Session**: one `stdio-<32 hex>` session id per wrapper lifetime binds taint tracking and ledger v2 entries across every call.
+- **Secret hygiene**: every `AEGIS_*` variable (e.g. `AEGIS_API_KEY`, `AEGIS_DLP_HMAC_KEY`) is stripped from the server's environment; the server is spawned with `shell=False`.
+
 ---
 
 ## 🧪 Quality Gates
