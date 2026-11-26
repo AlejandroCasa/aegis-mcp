@@ -43,7 +43,13 @@ import httpx
 
 from app.firewall import MCPFirewall
 from app.policy import PolicyEngine
-from app.schemas import MCPToolCallRequest
+from app.rate_limit import BehaviorRateLimiter, LimiterConfig
+from app.schemas import (
+    MAX_VELOCITY_READS,
+    MCPToolCallRequest,
+    TokenBucketLimit,
+    VelocityLimit,
+)
 from scripts.evaluate_detection import MACROS, percentile
 
 DEFAULT_ITERATIONS = 500
@@ -184,10 +190,27 @@ def quiet_logs() -> Iterator[None]:
 
 @contextmanager
 def bench_firewall() -> Iterator[MCPFirewall]:
-    """Yield a firewall bound to a temporary WAL-mode SQLite ledger."""
+    """Yield a firewall bound to a temporary WAL-mode SQLite ledger.
+
+    The behavioral rate limiter stays on (its cost is part of the measured
+    path) but with effectively unbounded limits: the benchmark deliberately
+    replays one call thousands of times, which is exactly the burst the
+    limiter would otherwise block.
+    """
     with tempfile.TemporaryDirectory(prefix="aegis-latency-") as tmp:
+        limiter = BehaviorRateLimiter(
+            LimiterConfig(
+                enabled=True,
+                bucket=TokenBucketLimit(capacity=1_000_000, refill_per_sec=1_000_000),
+                velocity=VelocityLimit(
+                    window_seconds=0.001, max_reads=MAX_VELOCITY_READS
+                ),
+            )
+        )
         firewall = MCPFirewall(
-            db_path=str(Path(tmp) / "bench_audit.db"), policy_engine=PolicyEngine()
+            db_path=str(Path(tmp) / "bench_audit.db"),
+            policy_engine=PolicyEngine(),
+            rate_limiter=limiter,
         )
         try:
             yield firewall

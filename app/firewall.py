@@ -39,6 +39,14 @@ from app.policy import (
     build_policy_engine,
     evaluate_action,
 )
+from app.rate_limit import (
+    RATE_ANOMALY_KINDS,
+    VELOCITY_VIOLATION,
+    BehaviorRateLimiter,
+    LimiterConfig,
+    RateScope,
+    RateVerdict,
+)
 from app.redactor import redact_payload
 from app.schemas import (
     AuditEntry,
@@ -49,6 +57,8 @@ from app.schemas import (
     MCPToolCallRequest,
     PolicyDocument,
     TaintLabel,
+    TokenBucketLimit,
+    VelocityLimit,
 )
 from app.taint import (
     TOXIC_FLOW_VIOLATION,
@@ -151,6 +161,22 @@ def evaluate_threats(payload_text: str) -> tuple[int, list[str]]:
     return max_score, violations
 
 
+def limiter_config_from_settings() -> LimiterConfig:
+    """Build the rate limiter defaults from ``AEGIS_RATE_LIMIT_*`` settings."""
+    return LimiterConfig(
+        enabled=settings.rate_limit_enabled,
+        bucket=TokenBucketLimit(
+            capacity=settings.rate_limit_capacity,
+            refill_per_sec=settings.rate_limit_refill_per_sec,
+        ),
+        velocity=VelocityLimit(
+            window_seconds=settings.velocity_window_seconds,
+            max_reads=settings.velocity_max_reads,
+        ),
+        max_keys=settings.rate_limit_max_keys,
+    )
+
+
 class MCPFirewall:
     """Inspects MCP tool calls, applies DLP redaction, and maintains a hash chain."""
 
@@ -161,8 +187,9 @@ class MCPFirewall:
         taint: SessionTaintTracker | None = None,
         approvals: ApprovalQueue | None = None,
         webhooks: WebhookDispatcher | None = None,
+        rate_limiter: BehaviorRateLimiter | None = None,
     ) -> None:
-        """Initialize ledger, RBAC engine, taint, HITL queue and webhooks.
+        """Initialize ledger, RBAC engine, taint, rate limits, HITL and webhooks.
 
         Without an explicit engine the startup policy is built fail-closed:
         ``AEGIS_ENVIRONMENT=prod`` with no valid policy denies every call.
@@ -176,6 +203,9 @@ class MCPFirewall:
         )
         self.taint = taint or SessionTaintTracker(
             settings.mcp_session_ttl_seconds, settings.mcp_max_sessions
+        )
+        self.rate_limiter = rate_limiter or BehaviorRateLimiter(
+            limiter_config_from_settings()
         )
         self.ledger = AuditLedger(
             self.db_path,
@@ -309,6 +339,25 @@ class MCPFirewall:
         roles = classify(document, call, settings.taint_default_heuristics)
         return evaluate_flow(self.taint.labels(session_id), roles, call, redacted)
 
+    def _rate_check(
+        self, document: PolicyDocument, request: MCPToolCallRequest, session_id: str
+    ) -> RateVerdict:
+        """Token-bucket and exfiltration-velocity verdict (counted in metrics)."""
+        verdict = self.rate_limiter.check(
+            document,
+            RateScope(
+                request.agent_id,
+                request.server_name,
+                request.tool_name,
+                request.environment,
+                session_id,
+            ),
+        )
+        enforced = settings.policy_mode == "enforce"
+        for code in RATE_ANOMALY_KINDS.intersection(verdict.violations):
+            metrics_registry.record_rate_anomaly(code, enforced)
+        return verdict
+
     def taint_session(
         self, session_id: str, subject: str, labels: frozenset[TaintLabel]
     ) -> None:
@@ -431,19 +480,25 @@ class MCPFirewall:
         )
         if flow.toxic:
             violations.append(TOXIC_FLOW_VIOLATION)
+        rate = self._rate_check(snapshot[0], request, session_id)
+        violations.extend(rate.violations)
         denied = policy_denied or bool(denials) or flow.toxic
         hitl = self._gate_if_clean(
-            (requires_approval, denied, risk_score),
+            (requires_approval, any((denied, rate.blocking)), risk_score),
             request,
             subject,
             sanitized_args,
             session_id,
         )
         violations.extend(hitl.violations)
-        risk_score = self._risk(risk_score, denied, bool(redacted_categories), hitl)
+        risk_score = self._risk(
+            max(risk_score, rate.risk_score), denied, bool(redacted_categories), hitl
+        )
 
         allowed, decision, would_block = self._decide(
-            risk_score, denied or hitl.blocking, bool(redacted_categories)
+            risk_score,
+            any((denied, hitl.blocking, rate.blocking)),
+            bool(redacted_categories),
         )
         if allowed:
             self.taint_session(session_id, request.tool_name, flow.carried)
@@ -483,10 +538,14 @@ class MCPFirewall:
         )
 
     def _notify(self, record: LedgerRecord, entry_hash: str, hitl: HitlOutcome) -> None:
-        """Fire-and-forget webhooks: new approval requests and BLOCKED incidents."""
+        """Fire-and-forget webhooks: approval requests and security incidents.
+
+        Incidents are BLOCKED calls plus exfiltration velocity anomalies,
+        which are announced even when monitor mode lets the call through.
+        """
         if hitl.created and hitl.approval is not None:
             self.webhooks.notify_approval(hitl.approval)
-        if record.decision == "BLOCKED":
+        if record.decision == "BLOCKED" or VELOCITY_VIOLATION in record.violations:
             self.webhooks.notify_incident(
                 Incident(
                     agent_id=record.agent_id,
@@ -589,8 +648,9 @@ class MCPFirewall:
         self.webhooks.close()
 
     def reset(self) -> None:
-        """Clear ledger, taint, HITL queue and webhook cooldowns (isolation)."""
+        """Clear ledger, taint, rate limits, HITL and webhook state (isolation)."""
         self.ledger.reset()
         self.taint.reset()
+        self.rate_limiter.reset()
         self.approvals.reset()
         self.webhooks.reset()

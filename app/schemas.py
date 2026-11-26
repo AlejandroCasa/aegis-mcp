@@ -452,6 +452,71 @@ class ToolTaintRule(BaseModel):
     )
 
 
+MAX_VELOCITY_READS = 4096
+MAX_VELOCITY_WINDOW_SECONDS = 3600.0
+
+
+class TokenBucketLimit(BaseModel):
+    """Token-bucket rate limit for one ``(agent, server, tool)`` key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capacity: float = Field(..., gt=0, le=1_000_000, description="Burst size.")
+    refill_per_sec: float = Field(
+        ..., ge=0, le=1_000_000, description="Tokens restored per second."
+    )
+
+
+class VelocityLimit(BaseModel):
+    """Sliding-window cap on sensitive reads per ``(session, agent)``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_seconds: float = Field(
+        ..., gt=0, le=MAX_VELOCITY_WINDOW_SECONDS, description="Window length."
+    )
+    max_reads: int = Field(
+        ..., ge=1, le=MAX_VELOCITY_READS, description="Reads allowed per window."
+    )
+
+
+class ToolRateLimit(BaseModel):
+    """Declarative rate / exfiltration-velocity override for matching tools.
+
+    The first matching rule wins. ``rate_limit`` and ``velocity_limit``
+    replace the global ``AEGIS_RATE_LIMIT_*`` / ``AEGIS_VELOCITY_*`` defaults;
+    ``sensitive_read`` forces (``true``) or exempts (``false``) the tool from
+    velocity accounting regardless of the built-in heuristics. A rule with a
+    ``velocity_limit`` and no explicit ``sensitive_read`` marks the tool as a
+    sensitive read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_name: GlobPattern = Field(default="*", description="Server glob.")
+    tool_name: GlobPattern = Field(default="*", description="Tool-name glob.")
+    environments: list[Environment] = Field(
+        default_factory=_all_environments, min_length=1, max_length=3
+    )
+    rate_limit: TokenBucketLimit | None = Field(default=None)
+    velocity_limit: VelocityLimit | None = Field(default=None)
+    sensitive_read: bool | None = Field(default=None)
+
+
+class RateLimitStats(BaseModel):
+    """Operational snapshot of the behavioral rate limiter."""
+
+    enabled: bool = Field(..., description="AEGIS_RATE_LIMIT_ENABLED.")
+    capacity: float = Field(..., description="Default token-bucket capacity.")
+    refill_per_sec: float = Field(..., description="Default refill rate.")
+    velocity_window_seconds: float = Field(..., description="Default window.")
+    velocity_max_reads: int = Field(..., description="Default reads per window.")
+    tracked_buckets: int = Field(..., description="Live token buckets.")
+    tracked_sessions: int = Field(..., description="Live velocity windows.")
+    rate_limited_total: int = Field(..., description="Token-bucket denials.")
+    velocity_anomalies_total: int = Field(..., description="Velocity anomalies.")
+
+
 class SessionTaintStatus(BaseModel):
     """Toxic-flow taint state of one agent session (observability)."""
 
@@ -491,6 +556,11 @@ class PolicyDocument(BaseModel):
         default_factory=list,
         max_length=1024,
         description="Toxic-flow taint classification (lethal trifecta defense).",
+    )
+    rate_limits: list[ToolRateLimit] = Field(
+        default_factory=list,
+        max_length=1024,
+        description="Rate-limit / exfiltration-velocity overrides (first match).",
     )
 
 

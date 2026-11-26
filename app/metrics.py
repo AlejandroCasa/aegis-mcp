@@ -34,6 +34,9 @@ INSPECTION_BUCKETS: Final[tuple[float, ...]] = (
 )
 
 LEDGER_ERROR_KINDS: Final = frozenset({"chain_tampered", "checkpoint_error"})
+RATE_ANOMALY_KINDS: Final = frozenset(
+    {"rate_limit_exceeded", "exfiltration_velocity_anomaly"}
+)
 
 
 class LabelLimiter:
@@ -75,6 +78,12 @@ def _request_labels(key: Hashable) -> str:
     """Format ``(server, decision)`` labels."""
     server, decision = cast(tuple[str, str], key)
     return f'decision="{decision}",server="{server}"'
+
+
+def _anomaly_labels(key: Hashable) -> str:
+    """Format ``(kind, mode)`` labels."""
+    kind, mode = cast(tuple[str, str], key)
+    return f'kind="{kind}",mode="{mode}"'
 
 
 class Histogram:
@@ -129,6 +138,7 @@ class MetricsRegistry:
         self._redactions_total: Counter[Hashable] = Counter()
         self._shadow_total: Counter[Hashable] = Counter()
         self._ledger_errors_total: Counter[Hashable] = Counter()
+        self._rate_anomalies_total: Counter[Hashable] = Counter()
         self._inspection_duration = Histogram(INSPECTION_BUCKETS)
         self._limiters = {
             name: LabelLimiter()
@@ -181,6 +191,18 @@ class MetricsRegistry:
         with self._lock:
             self._ledger_errors_total[kind] += 1
 
+    def record_rate_anomaly(self, kind: str, enforced: bool) -> None:
+        """Count a behavioral rate anomaly (see ``RATE_ANOMALY_KINDS``).
+
+        ``enforced`` distinguishes blocked calls from monitor-mode verdicts.
+        """
+        if kind not in RATE_ANOMALY_KINDS:
+            raise ValueError(f"Unknown rate anomaly kind: {kind}")
+        with self._lock:
+            self._rate_anomalies_total[
+                (kind, "enforce" if enforced else "monitor")
+            ] += 1
+
     def _histogram_lines(self) -> list[str]:
         """Render the inspection latency histogram family."""
         name = "aegis_mcp_inspection_duration_seconds"
@@ -224,6 +246,12 @@ class MetricsRegistry:
                     self._ledger_errors_total,
                     lambda kind: f'kind="{kind}"',
                 ),
+                *_counter_lines(
+                    "aegis_mcp_rate_anomalies_total",
+                    "Tool-call rate limit and exfiltration velocity anomalies.",
+                    self._rate_anomalies_total,
+                    _anomaly_labels,
+                ),
                 *self._histogram_lines(),
                 "",
             ]
@@ -237,6 +265,7 @@ class MetricsRegistry:
             self._redactions_total.clear()
             self._shadow_total.clear()
             self._ledger_errors_total.clear()
+            self._rate_anomalies_total.clear()
             self._inspection_duration.clear()
             for limiter in self._limiters.values():
                 limiter.clear()

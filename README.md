@@ -45,6 +45,10 @@ Aegis-MCP sits between AI Agents (Claude Desktop, Cursor, autonomous orchestrato
 | `AEGIS_MCP_ALLOWED_ORIGINS` | `[]` | JSON list of browser `Origin`s allowed on `/mcp` (DNS-rebinding defense); requests without `Origin` are allowed, any other origin gets `403`. |
 | `AEGIS_MCP_SESSION_TTL_SECONDS` / `AEGIS_MCP_MAX_SESSIONS` | `3600` / `10000` | Sliding idle lifetime and capacity (`503` when full) of `/mcp` sessions. |
 | `AEGIS_MCP_STREAM_TIMEOUT_SECONDS` | `300` | Wall-clock cap of one relayed SSE stream (and the upstream read timeout for streams). |
+| `AEGIS_RATE_LIMIT_ENABLED` | `true` | Behavioral rate limiting (`app/rate_limit.py`). Both detectors block in `enforce` mode and set `would_block` in `monitor` mode; anomalies are counted in `aegis_mcp_rate_anomalies_total{kind,mode}` and summarized at `GET /api/v1/rate-limits/stats`. |
+| `AEGIS_RATE_LIMIT_CAPACITY` / `AEGIS_RATE_LIMIT_REFILL_PER_SEC` | `60` / `5.0` | Token bucket per `(agent_id, server_name, tool_name)`; an empty bucket yields `rate_limit_exceeded` (risk 75). |
+| `AEGIS_VELOCITY_WINDOW_SECONDS` / `AEGIS_VELOCITY_MAX_READS` | `60` / `30` | Sliding window of sensitive reads (`resources/read`, `query*`, `read_file*`, `*sql*`, `db_*`, ...) per `(session_id, agent_id)`; exceeding it yields `exfiltration_velocity_anomaly` (risk 90, security webhook even in `monitor` mode). Sessionless calls share one per-agent window. Policy YAML `rate_limits` rules (first match wins) override `rate_limit`, `velocity_limit` and `sensitive_read` per server/tool/environment. |
+| `AEGIS_RATE_LIMIT_MAX_KEYS` | `10000` | LRU cap of tracked buckets and velocity windows (bounded memory). |
 | `AEGIS_LEDGER_WAL` | `true` | SQLite write-ahead logging for the audit ledger (readers never block the chain writer). |
 | `AEGIS_OTEL_ENABLED` | unset | Export OpenTelemetry traces over OTLP/HTTP. Unset follows `AEGIS_OTEL_ENDPOINT` (off in dev/test, on once an endpoint is configured). |
 | `AEGIS_OTEL_ENDPOINT` | unset | OTLP/HTTP collector base URL (e.g. `http://otel-collector:4318`; `/v1/traces` is appended). Without it, the standard `OTEL_EXPORTER_OTLP_*` variables apply. |

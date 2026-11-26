@@ -52,6 +52,18 @@ class Settings(BaseSettings):
     # on top of the policy's declarative ``taint_rules``.
     enable_taint_tracking: bool = True
     taint_default_heuristics: bool = True
+    # Behavioral rate limiting: a token bucket per ``(agent, server, tool)``
+    # (``rate_limit_exceeded``, risk 75) and a sliding-window exfiltration
+    # velocity detector per ``(session, agent)`` counting sensitive reads
+    # such as ``resources/read`` / ``query_db`` / ``read_file``
+    # (``exfiltration_velocity_anomaly``, risk 90). Both block in enforce mode
+    # and set ``would_block`` in monitor mode; policy ``rate_limits`` override.
+    rate_limit_enabled: bool = True
+    rate_limit_capacity: float = Field(default=60.0, gt=0, le=1_000_000)
+    rate_limit_refill_per_sec: float = Field(default=5.0, ge=0, le=1_000_000)
+    velocity_window_seconds: float = Field(default=60.0, gt=0, le=3600)
+    velocity_max_reads: int = Field(default=30, ge=1, le=4096)
+    rate_limit_max_keys: int = Field(default=10_000, ge=1)
     mcp_upstreams: dict[str, str] = Field(default_factory=dict)
     upstream_timeout_seconds: float = 10.0
 

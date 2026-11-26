@@ -303,6 +303,7 @@ class DetectionHarness:
         policy = case.payload.get("policy") or {}
         self.firewall.policy_engine.load(PolicyDocument.model_validate(policy))
         self.firewall.taint.reset()
+        self.firewall.rate_limiter.reset()
 
     def _inspect(self, request: dict[str, Any], session_id: str) -> list[str]:
         call = MCPToolCallRequest.model_validate(expand_macros(request))

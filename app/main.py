@@ -53,6 +53,7 @@ from app.schemas import (
     MCPToolCallRequest,
     PolicyDocument,
     PolicyStatus,
+    RateLimitStats,
     SessionTaintStatus,
     SignedCheckpoint,
     ToolApproval,
@@ -368,6 +369,17 @@ def get_session_taint(
 ) -> SessionTaintStatus:
     """Return a session's toxic-flow taint labels and lethal-trifecta state."""
     return firewall.taint.status(session_id)
+
+
+@app.get(
+    "/api/v1/rate-limits/stats",
+    response_model=RateLimitStats,
+    dependencies=[Depends(authenticate)],
+    tags=["Rate Limiting"],
+)
+def get_rate_limit_stats() -> RateLimitStats:
+    """Return rate-limiter defaults, tracked keys and anomaly counters."""
+    return firewall.rate_limiter.stats()
 
 
 @app.get(
