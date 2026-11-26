@@ -45,6 +45,13 @@ jobs:
       - name: Phase 1.5 — Detection Benchmark Gate (OWASP / ATLAS Corpus, Recall & FPR)
         run: uv run python -m scripts.evaluate_detection --min-recall 0.95 --max-fpr 0.02 --min-cases 300
 
+      # Gates pure MCPFirewall.inspect overhead (regex / canonicalization / DLP /
+      # SQLite WAL ledger) so shared runners do not flake on HTTP socket
+      # scheduling; ASGI end-to-end numbers are reported but not gated.
+      - name: Phase 1.6 — Latency Budget Gate (MCPFirewall.inspect p99 <= 10 ms)
+        id: latency-gate
+        run: uv run --no-sync python -m scripts.benchmark_latency --iterations 300 --max-p99-ms 10.0 --fail-on-regression
+
       # =========================================================================
       # PHASE 2: SAST, SCA & Complexity Governance
       # =========================================================================

@@ -153,7 +153,47 @@ uv run mypy --strict app tests fuzz scripts
 uv run pytest -v --cov=app --cov-report=term-missing --cov-fail-under=85
 uv run python -m fuzz.fuzz_firewall --self-test
 uv run python -m scripts.evaluate_detection --min-recall 0.95 --max-fpr 0.02 --min-cases 300
+uv run python -m scripts.benchmark_latency --iterations 300 --max-p99-ms 10.0 --fail-on-regression
 ```
+
+---
+
+## Latency Budget & Load Testing
+
+The gateway has a **10 ms p99** latency budget per firewalled call.
+
+### Reproducible benchmark (`make bench`)
+
+`scripts/benchmark_latency.py` runs two suites in-process against a temporary SQLite (WAL) audit ledger:
+
+| Suite | Scenarios |
+| :--- | :--- |
+| `inspect` | `MCPFirewall.inspect` on `benign`, `dlp_heavy` (synthetic secrets, email, IBAN), `obfuscated` (Base64, full-width and zero-width Unicode injection) and `blocked` (command injection) calls |
+| `asgi` | FastAPI end to end: `POST /api/v1/mcp/inspect` and `POST /api/v1/mcp/jsonrpc` (in-memory mock upstream) |
+
+For each scenario it reports p50 / p95 / p99 / max latency in ms and sequential throughput in rps. Output is a JSON report followed by a Markdown table; `--json-out FILE` also saves the JSON. Every run starts with untimed warm-up calls (`--warmup`, default 50) and then times `--iterations` calls (default 500).
+
+```bash
+make bench                                      # or: uv run python -m scripts.benchmark_latency
+make bench-gate                                 # CI gate: --iterations 300 --fail-on-regression
+uv run python -m scripts.benchmark_latency --skip-asgi --json-out bench.json
+```
+
+**CI regression gate.** With `--fail-on-regression`, the script exits `1` when the **worst `inspect` scenario p99** is above `--max-p99-ms` (default `10.0`). CI runs this as the `latency-gate` step. Only the pure `inspect` overhead is gated, which catches algorithmic regressions in regex, canonicalization or DLP code. The ASGI numbers are reported but not gated, so CI does not fail on socket and thread-pool scheduling noise on shared runners.
+
+### Load test (k6, `make load`)
+
+`benchmarks/load_k6.js` sends an open-model load (`constant-arrival-rate`) of **500 rps total**, split evenly between `/api/v1/mcp/inspect` and `/api/v1/mcp/jsonrpc`. Its thresholds are `http_req_duration p(99)<10` overall and per endpoint, plus `http_req_failed < 1%`. `benchmarks/mock_upstream.py` is a stdlib-only JSON-RPC echo server that stands in for a real MCP tool server.
+
+```bash
+uv run python benchmarks/mock_upstream.py --port 9100 &
+AEGIS_MCP_UPSTREAMS='{"bench-mcp":"http://127.0.0.1:9100/mcp"}' \
+  uv run uvicorn app.main:app --port 8000 &   # single worker: one SQLite chain writer
+make load                     # k6 run benchmarks/load_k6.js (RATE=500 DURATION=60s)
+make load RATE=1000 DURATION=2m BASE_URL=http://gateway:8000
+```
+
+Pass `API_KEY` (`k6 run -e API_KEY=...`) when `AEGIS_API_KEY` is set. k6 exits non-zero when any threshold is breached.
 
 ---
 
