@@ -104,8 +104,15 @@ def test_policy_version_is_jcs_sha256_and_tracks_reloads() -> None:
     engine.load(document)
     assert engine.fail_closed is False
     assert engine.version == policy_version(document)
-    # An empty ``taint_rules`` is omitted so pre-taint versions stay stable.
-    legacy = document.model_dump(mode="json", exclude={"taint_rules"})
+    # Empty ``taint_rules`` / ``require_approval_tools`` are omitted so
+    # versions of documents predating those features stay stable.
+    legacy = document.model_dump(
+        mode="json",
+        exclude={
+            "taint_rules": True,
+            "rules": {"__all__": {"require_approval_tools"}},
+        },
+    )
     assert engine.version == sha256_hex(legacy)
     assert engine.version != fail_closed_version
     assert PolicyEngine(document).version == engine.version

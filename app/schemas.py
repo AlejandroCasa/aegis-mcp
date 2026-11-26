@@ -16,6 +16,10 @@ PolicyMode = Literal["enforce", "monitor"]
 Decision = Literal["ALLOWED", "SANITIZED", "BLOCKED"]
 TaintRole = Literal["untrusted_content", "private_data", "egress_sink"]
 TaintLabel = Literal["untrusted_content", "private_data"]
+PolicyAction = Literal["allow", "deny", "require_approval"]
+ApprovalStatus = Literal["pending", "approved", "denied", "expired"]
+ApprovalId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
+"""Opaque HITL approval identifier (UUID4 hex)."""
 
 GlobPattern = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 """Case-sensitive ``fnmatch`` glob (``*``, ``?``, ``[seq]``) for RBAC matching."""
@@ -63,6 +67,10 @@ class MCPToolCallRequest(BaseModel):
         default="",
         max_length=1024,
         description="Optional agent session for toxic-flow taint tracking.",
+    )
+    approval_id: ApprovalId | None = Field(
+        default=None,
+        description="HITL approval to redeem for a ``require_approval`` call.",
     )
 
 
@@ -118,6 +126,14 @@ class MCPInspectionResponse(BaseModel):
     policy_version: str = Field(
         default="",
         description="SHA-256 (RFC 8785 JCS) of the policy document that decided.",
+    )
+    approval_id: str | None = Field(
+        default=None,
+        description="HITL approval request bound to this call, if any.",
+    )
+    approval_status: ApprovalStatus | None = Field(
+        default=None,
+        description="Status of the bound HITL approval request.",
     )
 
 
@@ -196,6 +212,8 @@ class PolicyRule(BaseModel):
     A rule applies when ``agent_id`` and ``server_name`` glob-match the call and
     the call's environment is listed. ``deny_tools`` always win; a non-empty
     ``allow_tools`` turns the rule into an allowlist for the matched scope.
+    ``require_approval_tools`` gate matching tools behind a human-in-the-loop
+    approval (and satisfy any allowlist in scope).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -224,12 +242,20 @@ class PolicyRule(BaseModel):
         max_length=512,
         description="Tool-name globs always denied for the matched scope.",
     )
+    require_approval_tools: list[GlobPattern] = Field(
+        default_factory=list,
+        max_length=512,
+        description="Tool-name globs requiring human approval in the scope.",
+    )
 
     @model_validator(mode="after")
     def _require_effect(self) -> "PolicyRule":
-        """Reject no-op rules (e.g. a typo leaving both tool lists empty)."""
-        if not self.allow_tools and not self.deny_tools:
-            raise ValueError("RBAC rule must declare allow_tools or deny_tools.")
+        """Reject no-op rules (e.g. a typo leaving every tool list empty)."""
+        if not (self.allow_tools or self.deny_tools or self.require_approval_tools):
+            raise ValueError(
+                "RBAC rule must declare allow_tools, deny_tools or "
+                "require_approval_tools."
+            )
         return self
 
 
@@ -410,7 +436,7 @@ class PolicyDocument(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    default_action: Literal["allow", "deny"] = Field(
+    default_action: PolicyAction = Field(
         default="allow",
         description="Decision applied when no matching rule declares an allowlist.",
     )
@@ -429,3 +455,36 @@ class PolicyDocument(BaseModel):
         max_length=1024,
         description="Toxic-flow taint classification (lethal trifecta defense).",
     )
+
+
+class HitlApproval(BaseModel):
+    """A human-in-the-loop approval request for a ``require_approval`` call."""
+
+    id: str = Field(..., description="Approval identifier (UUID4 hex).")
+    agent_id: str = Field(..., description="Requesting agent.")
+    server_name: str = Field(..., description="Target MCP server.")
+    tool_name: str = Field(..., description="Gated tool.")
+    environment: str = Field(..., description="Deployment environment.")
+    arguments_hash: str = Field(..., description="JCS SHA-256 of the arguments.")
+    sanitized_arguments: dict[str, Any] = Field(
+        default_factory=dict, description="DLP-redacted arguments for review."
+    )
+    session_id: str = Field(default="", description="Agent session, if any.")
+    status: ApprovalStatus = Field(..., description="Lifecycle status.")
+    created_at: str = Field(..., description="ISO-8601 UTC creation time.")
+    expires_at: str = Field(..., description="ISO-8601 UTC expiry (TTL bound).")
+    resolved_by: str | None = Field(default=None, description="Resolver identity.")
+    resolved_at: str | None = Field(default=None, description="Resolution time.")
+    reason: str | None = Field(default=None, description="Resolution reason.")
+    consumed_at: str | None = Field(
+        default=None, description="Single-use redemption time of an approval."
+    )
+
+
+class ApprovalResolution(BaseModel):
+    """Operator decision on a pending HITL approval request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["approved", "denied"] = Field(..., description="Decision.")
+    reason: str | None = Field(default=None, max_length=1024)

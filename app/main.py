@@ -12,6 +12,7 @@ from fastapi import (
     Header,
     HTTPException,
     Path,
+    Query,
     Request,
     Response,
     Security,
@@ -21,6 +22,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from starlette.concurrency import run_in_threadpool
 
+from app.approvals import (
+    MAX_LIST_LIMIT,
+    ApprovalConflictError,
+    ApprovalNotFoundError,
+)
 from app.auth import (
     WELL_KNOWN_PATH,
     AuthError,
@@ -34,8 +40,11 @@ from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
 from app.metrics import metrics_registry
 from app.policy import build_policy_engine
 from app.schemas import (
+    ApprovalResolution,
+    ApprovalStatus,
     AuditEntry,
     ChainVerificationResponse,
+    HitlApproval,
     MCPInspectionResponse,
     MCPToolCallRequest,
     PolicyDocument,
@@ -331,6 +340,82 @@ def approve_tool_pin(approval: ToolApproval) -> ToolPin:
         pin.fingerprint,
     )
     return pin
+
+
+def require_approver(
+    api_key: str | None = Security(api_key_header),
+    authorization: str | None = Header(default=None),
+) -> str:
+    """Authorize a HITL operator and return its identity for the audit trail.
+
+    ``oauth`` mode requires a valid Bearer token carrying
+    ``AEGIS_HITL_APPROVER_SCOPE``; ``api_key`` mode requires the configured
+    admin X-API-Key (fail-closed when none is configured).
+    """
+    if not resource_server.enabled:
+        require_admin_api_key(api_key)
+        return "api-key-admin"
+    principal = authenticate(api_key, authorization)
+    if principal is None or settings.hitl_approver_scope not in principal.scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Approvals require the '{settings.hitl_approver_scope}' scope.",
+        )
+    return principal.agent_id
+
+
+Approver = Annotated[str, Depends(require_approver)]
+
+
+@app.get(
+    "/api/v1/approvals",
+    response_model=list[HitlApproval],
+    tags=["HITL Approvals"],
+)
+def list_approvals(
+    _approver: Approver,
+    approval_status: Annotated[ApprovalStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIST_LIMIT)] = 100,
+) -> list[HitlApproval]:
+    """Return HITL approval requests (newest first), optionally by status."""
+    return firewall.approvals.list_requests(approval_status, limit)
+
+
+@app.post(
+    "/api/v1/approvals/{approval_id}",
+    response_model=HitlApproval,
+    tags=["HITL Approvals"],
+)
+def resolve_approval(
+    approval_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    resolution: ApprovalResolution,
+    approver: Approver,
+) -> HitlApproval:
+    """Approve or deny a pending request and ledger the decision."""
+    try:
+        approval = firewall.approvals.resolve(
+            approval_id, resolution.status, approver, resolution.reason
+        )
+    except ApprovalNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval request not found.",
+        ) from exc
+    except ApprovalConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Approval request is already {exc}.",
+        ) from exc
+    firewall.record_approval_event(approval)
+    logger.warning(
+        "HITL approval %s %s by %s (tool=%s server=%s)",
+        approval.id,
+        approval.status,
+        approver,
+        approval.tool_name,
+        approval.server_name,
+    )
+    return approval
 
 
 async def read_body_capped(request: Request, limit: int) -> bytes:

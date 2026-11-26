@@ -6,6 +6,16 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from app.approvals import (
+    HITL_DENIED_RISK_SCORE,
+    HITL_DENIED_VIOLATION,
+    HITL_GRANTED_EVENT,
+    ApprovalKey,
+    ApprovalQueue,
+    HitlOutcome,
+    gate_outcome,
+    monitor_outcome,
+)
 from app.config import settings
 from app.constraints import evaluate_constraints
 from app.ledger import (
@@ -23,13 +33,14 @@ from app.policy import (
     RBAC_VIOLATION,
     PolicyEngine,
     build_policy_engine,
-    evaluate_policy,
+    evaluate_action,
 )
 from app.redactor import redact_payload
 from app.schemas import (
     AuditEntry,
     ChainVerificationResponse,
     Decision,
+    HitlApproval,
     MCPInspectionResponse,
     MCPToolCallRequest,
     PolicyDocument,
@@ -43,6 +54,7 @@ from app.taint import (
     classify,
     evaluate_flow,
 )
+from app.webhooks import Incident, WebhookDispatcher
 
 __all__ = [
     "GENESIS_HASH",
@@ -140,11 +152,14 @@ class MCPFirewall:
         db_path: str | None = None,
         policy_engine: PolicyEngine | None = None,
         taint: SessionTaintTracker | None = None,
+        approvals: ApprovalQueue | None = None,
+        webhooks: WebhookDispatcher | None = None,
     ) -> None:
-        """Initialize SQLite audit ledger, RBAC policy engine, and taint tracker.
+        """Initialize ledger, RBAC engine, taint, HITL queue and webhooks.
 
         Without an explicit engine the startup policy is built fail-closed:
         ``AEGIS_ENVIRONMENT=prod`` with no valid policy denies every call.
+        An invalid ``AEGIS_WEBHOOK_URL`` raises ``WebhookConfigError``.
         """
         self.db_path = db_path or settings.db_path
         self.policy_engine = policy_engine or build_policy_engine(
@@ -155,19 +170,28 @@ class MCPFirewall:
         )
         self.ledger = AuditLedger(self.db_path, wal=settings.ledger_wal)
         self._init_db()
+        self.approvals = approvals or ApprovalQueue(
+            self.db_path, settings.hitl_timeout_seconds
+        )
+        self.webhooks = webhooks or WebhookDispatcher(
+            settings.webhook_url,
+            settings.environment,
+            settings.webhook_cooldown_seconds,
+            settings.webhook_timeout_seconds,
+        )
 
     def _apply_policy(
         self,
         snapshot: tuple[PolicyDocument, str, bool],
         request: MCPToolCallRequest,
         violations: list[str],
-        constraint_arguments: dict[str, Any] | None,
-    ) -> bool:
+        subject: dict[str, Any],
+    ) -> tuple[bool, bool]:
         """Evaluate RBAC and argument ABAC against one atomic policy snapshot.
 
         Appends ``rbac_policy_denied`` (plus ``policy_fail_closed`` under the
         startup deny-all fallback) and any ``argument_*`` constraint codes;
-        returns True if the call is denied.
+        returns ``(denied, requires_approval)``.
         """
         document, _, fail_closed = snapshot
         scope = (
@@ -176,17 +200,76 @@ class MCPFirewall:
             request.tool_name,
             request.environment,
         )
-        rbac_denied = not evaluate_policy(document, *scope)
+        action = evaluate_action(document, *scope)
+        rbac_denied = action == "deny"
         if rbac_denied:
             violations.append(RBAC_VIOLATION)
             if fail_closed:
                 violations.append(FAIL_CLOSED_VIOLATION)
-        subject = (
-            request.arguments if constraint_arguments is None else constraint_arguments
-        )
         argument_violations = evaluate_constraints(document, scope, subject)
         violations.extend(argument_violations)
-        return rbac_denied or bool(argument_violations)
+        return rbac_denied or bool(argument_violations), action == "require_approval"
+
+    def _hitl_gate(
+        self,
+        request: MCPToolCallRequest,
+        subject: dict[str, Any],
+        sanitized: dict[str, Any],
+        session_id: str,
+    ) -> HitlOutcome:
+        """Fail-closed human-in-the-loop gate for ``require_approval`` calls.
+
+        Monitor mode only audits ``hitl_approval_required``. Enforce mode
+        redeems a matching single-use approval (or the explicit
+        ``approval_id``), else registers/reuses a pending request and polls up
+        to ``AEGIS_HITL_WAIT_SECONDS`` for an operator decision.
+        """
+        if settings.policy_mode != "enforce":
+            return monitor_outcome()
+        key = ApprovalKey(
+            request.agent_id,
+            request.server_name,
+            request.tool_name,
+            request.environment,
+            digest_arguments(subject),
+        )
+        approval = self.approvals.claim(key, request.approval_id)
+        created = False
+        if approval is None:
+            approval, created = self.approvals.submit(key, sanitized, session_id)
+        wait = settings.hitl_wait_seconds
+        if approval.status != "pending" or wait <= 0:
+            return gate_outcome(approval, created, waited=False)
+        resolved = self.approvals.wait(key, approval.id, wait) or approval
+        return gate_outcome(resolved, created, waited=True)
+
+    def _gate_if_clean(
+        self,
+        state: tuple[bool, bool, int],
+        request: MCPToolCallRequest,
+        subject: dict[str, Any],
+        sanitized: dict[str, Any],
+        session_id: str,
+    ) -> HitlOutcome:
+        """Run the HITL gate for a ``require_approval`` call not yet blocked.
+
+        ``state`` is ``(requires_approval, denied, threat_risk_score)``. A
+        denied or threat-blocked call never opens an approval request, so an
+        operator is never asked to green-light e.g. a prompt-injection payload.
+        """
+        requires_approval, denied, risk_score = state
+        if not requires_approval or denied:
+            return HitlOutcome()
+        if risk_score >= settings.block_threshold_score:
+            return HitlOutcome()
+        return self._hitl_gate(request, subject, sanitized, session_id)
+
+    @staticmethod
+    def _risk(risk_score: int, denied: bool, redacted: bool, hitl: HitlOutcome) -> int:
+        """Final risk: 100 when denied, else the max of threat, DLP and HITL."""
+        if denied:
+            return RBAC_RISK_SCORE
+        return max(risk_score, 25 if redacted else 0, hitl.risk_score)
 
     def _taint_flow(
         self,
@@ -271,8 +354,13 @@ class MCPFirewall:
         violations.extend(denials)
         snapshot = self.policy_engine.snapshot()
         version = snapshot[1]
-        policy_denied = self._apply_policy(
-            snapshot, request, violations, constraint_arguments
+        subject = (
+            constraint_arguments
+            if constraint_arguments is not None
+            else request.arguments
+        )
+        policy_denied, requires_approval = self._apply_policy(
+            snapshot, request, violations, subject
         )
         sanitized_args, redacted_categories = self._redact(request.arguments)
         flow = self._taint_flow(
@@ -280,14 +368,19 @@ class MCPFirewall:
         )
         if flow.toxic:
             violations.append(TOXIC_FLOW_VIOLATION)
-        if policy_denied or denials or flow.toxic:
-            policy_denied = True
-            risk_score = RBAC_RISK_SCORE
-        elif redacted_categories:
-            risk_score = max(risk_score, 25)
+        denied = policy_denied or bool(denials) or flow.toxic
+        hitl = self._gate_if_clean(
+            (requires_approval, denied, risk_score),
+            request,
+            subject,
+            sanitized_args,
+            session_id,
+        )
+        violations.extend(hitl.violations)
+        risk_score = self._risk(risk_score, denied, bool(redacted_categories), hitl)
 
         allowed, decision, would_block = self._decide(
-            risk_score, policy_denied, bool(redacted_categories)
+            risk_score, denied or hitl.blocking, bool(redacted_categories)
         )
         if allowed:
             self.taint_session(session_id, request.tool_name, flow.carried)
@@ -308,6 +401,7 @@ class MCPFirewall:
             args_digest=digest_arguments(sanitized_args),
         )
         prev_hash, entry_hash = self._append(record)
+        self._notify(record, entry_hash, hitl)
 
         return MCPInspectionResponse(
             allowed=allowed,
@@ -322,7 +416,52 @@ class MCPFirewall:
             would_block=would_block,
             policy_mode=record.policy_mode,
             policy_version=version,
+            **hitl.response_fields(),
         )
+
+    def _notify(self, record: LedgerRecord, entry_hash: str, hitl: HitlOutcome) -> None:
+        """Fire-and-forget webhooks: new approval requests and BLOCKED incidents."""
+        if hitl.created and hitl.approval is not None:
+            self.webhooks.notify_approval(hitl.approval)
+        if record.decision == "BLOCKED":
+            self.webhooks.notify_incident(
+                Incident(
+                    agent_id=record.agent_id,
+                    server_name=record.server_name,
+                    tool_name=record.tool_name,
+                    environment=record.environment,
+                    risk_score=record.risk_score,
+                    violations=tuple(record.violations),
+                    audit_hash=entry_hash,
+                    timestamp=record.timestamp,
+                )
+            )
+
+    def record_approval_event(self, approval: HitlApproval) -> str:
+        """Append an operator HITL resolution to the hash chain; entry hash.
+
+        ``approved`` is ledgered as ``ALLOWED`` with ``hitl_approval_granted``;
+        ``denied`` as ``BLOCKED`` with ``hitl_approval_denied`` (risk 100).
+        """
+        granted = approval.status == "approved"
+        decision: Decision = "ALLOWED" if granted else "BLOCKED"
+        record = LedgerRecord(
+            agent_id=approval.agent_id,
+            server_name=approval.server_name,
+            tool_name=approval.tool_name,
+            environment=approval.environment,
+            decision=decision,
+            risk_score=0 if granted else HITL_DENIED_RISK_SCORE,
+            violations=[HITL_GRANTED_EVENT if granted else HITL_DENIED_VIOLATION],
+            redacted_categories=[],
+            timestamp=approval.resolved_at or datetime.now(UTC).isoformat(),
+            would_block=not granted,
+            policy_mode=settings.policy_mode,
+            policy_version=self.policy_engine.version,
+            session_id=approval.session_id,
+            args_digest=digest_arguments(approval.sanitized_arguments),
+        )
+        return self._append(record)[1]
 
     def record_event(
         self,
@@ -372,9 +511,12 @@ class MCPFirewall:
         return self.ledger.verify()
 
     def close(self) -> None:
-        """Graceful shutdown hook (connections are per-operation)."""
+        """Graceful shutdown: drain and stop the webhook worker pool."""
+        self.webhooks.close()
 
     def reset(self) -> None:
-        """Clear audit ledger and session taint for deterministic isolation."""
+        """Clear ledger, taint, HITL queue and webhook cooldowns (isolation)."""
         self.ledger.reset()
         self.taint.reset()
+        self.approvals.reset()
+        self.webhooks.reset()

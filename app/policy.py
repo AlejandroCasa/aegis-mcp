@@ -23,13 +23,13 @@ import threading
 from collections.abc import Iterable
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import yaml
 from pydantic import ValidationError
 
 from app.canonical import sha256_hex
-from app.schemas import Environment, PolicyDocument, PolicyRule
+from app.schemas import Environment, PolicyAction, PolicyDocument, PolicyRule
 
 RBAC_VIOLATION = "rbac_policy_denied"
 FAIL_CLOSED_VIOLATION = "policy_fail_closed"
@@ -94,6 +94,42 @@ def _rule_applies(
     )
 
 
+def evaluate_action(
+    document: PolicyDocument,
+    agent_id: str,
+    server_name: str,
+    tool_name: str,
+    environment: str,
+) -> PolicyAction:
+    """Return the policy action (``allow|deny|require_approval``) for a call.
+
+    ``deny_tools`` win; a ``require_approval_tools`` match satisfies any
+    allowlist in scope but gates the call behind human approval; otherwise
+    allowlists and then ``default_action`` decide.
+    """
+    matching = [
+        rule
+        for rule in document.rules
+        if _rule_applies(rule, agent_id, server_name, environment)
+    ]
+    if any(_matches_any(tool_name, rule.deny_tools) for rule in matching):
+        return "deny"
+    if any(_matches_any(tool_name, rule.require_approval_tools) for rule in matching):
+        return "require_approval"
+    return _allowlist_action(matching, tool_name, document.default_action)
+
+
+def _allowlist_action(
+    matching: list[PolicyRule], tool_name: str, default_action: PolicyAction
+) -> PolicyAction:
+    """Allowlists in scope decide; with none, ``default_action`` applies."""
+    allowlists = [rule.allow_tools for rule in matching if rule.allow_tools]
+    if not allowlists:
+        return default_action
+    allowed = any(_matches_any(tool_name, allow) for allow in allowlists)
+    return "allow" if allowed else "deny"
+
+
 def evaluate_policy(
     document: PolicyDocument,
     agent_id: str,
@@ -101,28 +137,23 @@ def evaluate_policy(
     tool_name: str,
     environment: str,
 ) -> bool:
-    """Return True if the policy matrix authorizes the tool call."""
-    matching = [
-        rule
-        for rule in document.rules
-        if _rule_applies(rule, agent_id, server_name, environment)
-    ]
-    if any(_matches_any(tool_name, rule.deny_tools) for rule in matching):
-        return False
-    allowlists = [rule.allow_tools for rule in matching if rule.allow_tools]
-    if allowlists:
-        return any(_matches_any(tool_name, allow) for allow in allowlists)
-    return document.default_action == "allow"
+    """Return True unless the matrix denies the call (approval still permits)."""
+    action = evaluate_action(document, agent_id, server_name, tool_name, environment)
+    return action != "deny"
 
 
 def policy_version(document: PolicyDocument) -> str:
     """Return the SHA-256 of the document's RFC 8785 canonical JSON form.
 
-    An empty ``taint_rules`` list is omitted so documents predating taint
-    rules keep their historical ``policy_version``.
+    Empty ``taint_rules`` and per-rule ``require_approval_tools`` are omitted
+    so documents predating those features keep their historical version.
     """
-    exclude = None if document.taint_rules else {"taint_rules"}
-    return sha256_hex(document.model_dump(mode="json", exclude=exclude))
+    exclude: dict[str, Any] = {}
+    if not document.taint_rules:
+        exclude["taint_rules"] = True
+    if not any(rule.require_approval_tools for rule in document.rules):
+        exclude["rules"] = {"__all__": {"require_approval_tools"}}
+    return sha256_hex(document.model_dump(mode="json", exclude=exclude or None))
 
 
 def fail_closed_document() -> PolicyDocument:

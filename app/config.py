@@ -62,6 +62,22 @@ class Settings(BaseSettings):
     mcp_max_sessions: int = 10_000
     mcp_stream_timeout_seconds: float = 300.0
 
+    # Human-in-the-loop approval gate (``require_approval`` policy action):
+    # pending requests (and granted, single-use approvals) expire after
+    # ``hitl_timeout_seconds``; a gated call may block up to
+    # ``hitl_wait_seconds`` polling for a decision before failing closed.
+    # In ``oauth`` mode resolvers need ``hitl_approver_scope``.
+    hitl_timeout_seconds: int = Field(default=900, ge=1, le=86_400)
+    hitl_wait_seconds: float = Field(default=0.0, ge=0.0, le=300.0)
+    hitl_approver_scope: str = "aegis:approve"
+
+    # Security webhook (approval requests and high-severity BLOCKED incidents):
+    # HTTPS only (plain http to localhost outside prod); in prod the target
+    # must not resolve to private, loopback, link-local or metadata addresses.
+    webhook_url: str | None = None
+    webhook_cooldown_seconds: float = Field(default=300.0, ge=0.0)
+    webhook_timeout_seconds: float = Field(default=3.0, gt=0.0, le=30.0)
+
     # Audit ledger: SQLite write-ahead logging (concurrent readers never
     # block the single chain writer).
     ledger_wal: bool = True
