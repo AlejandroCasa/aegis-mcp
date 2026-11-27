@@ -364,6 +364,8 @@ class AuditLedger:
             conn = sqlite3.connect(uri, isolation_level=None, uri=True)
         else:
             conn = sqlite3.connect(self.db_path, isolation_level=None)
+            if self.wal:
+                conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
         finally:
