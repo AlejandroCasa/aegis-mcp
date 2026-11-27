@@ -68,7 +68,12 @@ from app.taint import (
     classify,
     evaluate_flow,
 )
-from app.telemetry import decision_attributes, get_tracer, mcp_attributes
+from app.telemetry import (
+    decision_attributes,
+    get_tracer,
+    mcp_attributes,
+    sanitize_log_value,
+)
 from app.webhooks import Incident, WebhookDispatcher
 
 __all__ = [
@@ -426,11 +431,11 @@ class MCPFirewall:
                 "mcp tool call inspected",
                 extra={
                     "event": "mcp.inspection",
-                    "decision": report.decision,
+                    "decision": sanitize_log_value(report.decision),
                     "risk_score": report.risk_score,
-                    "violations": report.violations,
-                    "server_name": request.server_name,
-                    "tool_name": request.tool_name,
+                    "violations": [sanitize_log_value(v) for v in report.violations],
+                    "server_name": sanitize_log_value(request.server_name),
+                    "tool_name": sanitize_log_value(request.tool_name),
                     "duration_ms": round(elapsed * 1000, 3),
                 },
             )

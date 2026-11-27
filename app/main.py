@@ -68,6 +68,7 @@ from app.telemetry import (
     configure_logging,
     get_tracer,
     mcp_attributes,
+    sanitize_log_value,
     setup_tracing,
 )
 from app.toolguard import FingerprintMismatchError, PinNotFoundError
@@ -594,11 +595,11 @@ def resolve_approval(
     firewall.record_approval_event(approval)
     logger.warning(
         "HITL approval %s %s by %s (tool=%s server=%s)",
-        approval.id,
-        approval.status,
-        approver,
-        approval.tool_name,
-        approval.server_name,
+        sanitize_log_value(approval.id),
+        sanitize_log_value(approval.status),
+        sanitize_log_value(approver),
+        sanitize_log_value(approval.tool_name),
+        sanitize_log_value(approval.server_name),
     )
     return approval
 

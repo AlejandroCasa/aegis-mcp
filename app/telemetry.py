@@ -187,6 +187,12 @@ def resolve_request_id(candidate: str | None) -> str:
     return uuid.uuid4().hex
 
 
+def sanitize_log_value(value: object) -> str:
+    """Strip CR/LF and ASCII control chars to prevent log injection (CWE-117)."""
+    cleaned = str(value).replace("\r", "").replace("\n", "")
+    return "".join(ch if ord(ch) >= 32 and ord(ch) != 127 else "_" for ch in cleaned)
+
+
 def _scrub(value: Any) -> Any:
     """DLP-redact strings (recursively through lists); keep other scalars."""
     if isinstance(value, str):
