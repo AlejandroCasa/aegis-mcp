@@ -11,15 +11,24 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Path,
+    Query,
     Request,
     Response,
     Security,
     status,
 )
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
+from opentelemetry.util.types import AttributeValue
 from starlette.concurrency import run_in_threadpool
 
+from app.approvals import (
+    MAX_LIST_LIMIT,
+    ApprovalConflictError,
+    ApprovalNotFoundError,
+)
 from app.auth import (
     WELL_KNOWN_PATH,
     AuthError,
@@ -27,25 +36,47 @@ from app.auth import (
     Principal,
     build_resource_server,
 )
+from app.cockpit import STATIC_DIR, cockpit_response
 from app.config import settings
 from app.firewall import MCPFirewall
 from app.jsonrpc import MAX_REQUEST_BYTES, JsonRpcGateway
+from app.merkle import SignedTreeHead
 from app.metrics import metrics_registry
+from app.ocsf import NDJSON_MEDIA_TYPE, ocsf_lines
 from app.policy import build_policy_engine
 from app.schemas import (
+    ApprovalResolution,
+    ApprovalStatus,
     AuditEntry,
     ChainVerificationResponse,
+    CockpitSummary,
+    HitlApproval,
+    InclusionProofResponse,
     MCPInspectionResponse,
     MCPToolCallRequest,
     PolicyDocument,
     PolicyStatus,
+    RateLimitStats,
+    SessionTaintStatus,
+    SignedCheckpoint,
     ToolApproval,
     ToolPin,
 )
 from app.streamable import StreamableHttpTransport, TransportReply
+from app.telemetry import (
+    ObservabilityMiddleware,
+    configure_logging,
+    get_tracer,
+    mcp_attributes,
+    sanitize_log_value,
+    setup_tracing,
+)
 from app.toolguard import FingerprintMismatchError, PinNotFoundError
 
 logger = logging.getLogger("aegis_mcp.policy")
+
+configure_logging(settings.log_format)
+tracer_provider = setup_tracing(settings)
 
 policy_engine = build_policy_engine(settings.policy_path, settings.environment)
 firewall = MCPFirewall(policy_engine=policy_engine)
@@ -56,10 +87,12 @@ resource_server = build_resource_server(settings.auth_mode, settings.oauth_confi
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
-    """Manage application startup and graceful SQLite draining on shutdown."""
+    """Manage startup, graceful SQLite draining and span flushing on shutdown."""
     firewall._init_db()
     yield
     firewall.close()
+    if tracer_provider is not None:
+        tracer_provider.shutdown()
 
 
 app = FastAPI(
@@ -68,9 +101,13 @@ app = FastAPI(
         "Zero-Trust Firewall, DLP Redactor & Tamper-Evident Cryptographic "
         "Audit Proxy for Model Context Protocol (MCP) Servers."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
+app.add_middleware(ObservabilityMiddleware)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+AUDIT_FEED_MAX_LIMIT = 500
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -115,6 +152,9 @@ def authenticate(
 
 
 AuthenticatedPrincipal = Annotated[Principal | None, Depends(authenticate)]
+SessionIdHeader = Annotated[
+    str | None, Header(max_length=1024, pattern=r"^[\x21-\x7e]+$")
+]
 
 
 def require_admin_api_key(
@@ -137,6 +177,44 @@ def require_admin_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key authentication header.",
         )
+
+
+@app.get("/", tags=["Cockpit"], response_class=HTMLResponse, include_in_schema=False)
+def security_cockpit() -> HTMLResponse:
+    """Serve the operator Security & Audit Chain Inspector cockpit."""
+    return cockpit_response()
+
+
+@app.get(
+    "/api/v1/cockpit/summary",
+    response_model=CockpitSummary,
+    dependencies=[Depends(authenticate)],
+    tags=["Cockpit"],
+)
+def get_cockpit_summary() -> CockpitSummary:
+    """Return security-posture KPIs (counters, policy mode, rate anomalies)."""
+    snapshot = metrics_registry.snapshot()
+    totals = snapshot["totals"]
+    _, version, fail_closed = policy_engine.snapshot()
+    return CockpitSummary(
+        requests_total=totals["requests"],
+        decisions=snapshot["decisions"],
+        blocked_rule_hits=totals["blocked_rules"],
+        redactions_total=totals["redactions"],
+        redactions=snapshot["redactions"],
+        shadow_would_block=totals["shadow_would_block"],
+        rate_anomalies_total=totals["rate_anomalies"],
+        rate_anomalies=snapshot["rate_anomalies"],
+        ledger_errors=totals["ledger_errors"],
+        ledger_entries=firewall.ledger.count(),
+        policy_mode=settings.policy_mode,
+        policy_version=version,
+        environment=settings.environment,
+        fail_closed=fail_closed,
+        rate_limit_enabled=settings.rate_limit_enabled,
+        auth_mode=settings.auth_mode,
+        api_key_required=settings.api_key is not None,
+    )
 
 
 @app.get("/healthz", tags=["Health"])
@@ -185,11 +263,16 @@ def protected_resource_metadata(request: Request) -> JSONResponse:
 def inspect_mcp_tool_call(
     request: MCPToolCallRequest,
     principal: AuthenticatedPrincipal,
+    x_aegis_session_id: SessionIdHeader = None,
 ) -> MCPInspectionResponse:
-    """Inspect an MCP tool call, redact sensitive fields, and record in hash chain."""
+    """Inspect an MCP tool call, redact sensitive fields, and record in hash chain.
+
+    ``X-Aegis-Session-Id`` (or the body ``session_id``) opts the call into
+    toxic-flow taint tracking.
+    """
     if principal is not None:
         request = request.model_copy(update={"agent_id": principal.agent_id})
-    report = firewall.inspect(request)
+    report = firewall.inspect(request, session_id=x_aegis_session_id or "")
     metrics_registry.record_inspection(
         server_name=request.server_name,
         decision=report.decision,
@@ -212,6 +295,19 @@ def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
 
 
 @app.get(
+    "/api/v1/audit/entries",
+    response_model=list[AuditEntry],
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+)
+def list_recent_audit_entries(
+    limit: Annotated[int, Query(ge=1, le=AUDIT_FEED_MAX_LIMIT)] = 50,
+) -> list[AuditEntry]:
+    """Return the newest ``limit`` ledger entries, newest first (read-only)."""
+    return firewall.ledger.list_recent(limit)
+
+
+@app.get(
     "/api/v1/audit/verify",
     response_model=ChainVerificationResponse,
     dependencies=[Depends(authenticate)],
@@ -220,6 +316,128 @@ def list_audit_trail(agent_id: str | None = None) -> list[AuditEntry]:
 def verify_audit_chain() -> ChainVerificationResponse:
     """Verify the cryptographic integrity of the SHA-256 hash chain."""
     return firewall.verify_chain()
+
+
+def _checkpoint_model(checkpoint: SignedTreeHead) -> SignedCheckpoint:
+    """API representation of a Signed Tree Head."""
+    return SignedCheckpoint(**checkpoint.as_dict())
+
+
+@app.get(
+    "/api/v1/audit/proof/{entry_id}",
+    response_model=InclusionProofResponse,
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+    responses={404: {"description": "Ledger entry not found."}},
+)
+def get_inclusion_proof(
+    entry_id: Annotated[int, Path(ge=1)],
+) -> InclusionProofResponse:
+    """Return an RFC 6962 Merkle inclusion proof for one ledger entry.
+
+    The proof targets the latest Ed25519 Signed Tree Head (signed on demand
+    when it does not cover the entry yet and a signing key is configured).
+    """
+    bundle = firewall.ledger.inclusion_proof(entry_id)
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ledger entry not found.",
+        )
+    return InclusionProofResponse(
+        entry_id=bundle.entry_id,
+        leaf_index=bundle.leaf_index,
+        tree_size=bundle.tree_size,
+        entry_hash=bundle.entry_hash,
+        root_hash=bundle.root_hash,
+        audit_path=bundle.audit_path,
+        checkpoint=(
+            _checkpoint_model(bundle.checkpoint) if bundle.checkpoint else None
+        ),
+    )
+
+
+@app.get(
+    "/api/v1/audit/checkpoints",
+    response_model=list[SignedCheckpoint],
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+)
+def list_checkpoints() -> list[SignedCheckpoint]:
+    """Return every Ed25519 Signed Tree Head (oldest first)."""
+    return [_checkpoint_model(item) for item in firewall.ledger.list_checkpoints()]
+
+
+@app.post(
+    "/api/v1/audit/checkpoints",
+    response_model=SignedCheckpoint,
+    dependencies=[Depends(require_admin_api_key)],
+    tags=["Audit Ledger"],
+    responses={409: {"description": "Checkpoint signing is not configured."}},
+)
+def create_checkpoint() -> SignedCheckpoint:
+    """Manually sign a checkpoint over the current ledger tree."""
+    checkpoint = firewall.ledger.create_checkpoint()
+    if checkpoint is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Checkpoint signing is not configured.",
+        )
+    return _checkpoint_model(checkpoint)
+
+
+@app.get(
+    "/api/v1/audit/export/ocsf",
+    dependencies=[Depends(authenticate)],
+    tags=["Audit Ledger"],
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {NDJSON_MEDIA_TYPE: {}},
+            "description": "OCSF 1.3.0 API Activity events as JSON Lines.",
+        }
+    },
+)
+def export_ocsf(agent_id: str | None = None) -> StreamingResponse:
+    """Export ledger events as OCSF JSON Lines for SIEM ingestion.
+
+    Each event carries hash-chain/Merkle integrity evidence and EU AI Act
+    Art. 12 / ISO/IEC 42001 A.6.2.8 record-keeping metadata.
+    """
+    lines = ocsf_lines(
+        firewall.list_audit_entries(),
+        firewall.ledger.list_checkpoints(),
+        agent_id,
+    )
+    return StreamingResponse(
+        lines,
+        media_type=NDJSON_MEDIA_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="aegis-ocsf.jsonl"'},
+    )
+
+
+@app.get(
+    "/api/v1/sessions/{session_id}/taint",
+    response_model=SessionTaintStatus,
+    dependencies=[Depends(authenticate)],
+    tags=["Taint Tracking"],
+)
+def get_session_taint(
+    session_id: Annotated[str, Path(min_length=1, max_length=1024)],
+) -> SessionTaintStatus:
+    """Return a session's toxic-flow taint labels and lethal-trifecta state."""
+    return firewall.taint.status(session_id)
+
+
+@app.get(
+    "/api/v1/rate-limits/stats",
+    response_model=RateLimitStats,
+    dependencies=[Depends(authenticate)],
+    tags=["Rate Limiting"],
+)
+def get_rate_limit_stats() -> RateLimitStats:
+    """Return rate-limiter defaults, tracked keys and anomaly counters."""
+    return firewall.rate_limiter.stats()
 
 
 @app.get(
@@ -310,6 +528,82 @@ def approve_tool_pin(approval: ToolApproval) -> ToolPin:
     return pin
 
 
+def require_approver(
+    api_key: str | None = Security(api_key_header),
+    authorization: str | None = Header(default=None),
+) -> str:
+    """Authorize a HITL operator and return its identity for the audit trail.
+
+    ``oauth`` mode requires a valid Bearer token carrying
+    ``AEGIS_HITL_APPROVER_SCOPE``; ``api_key`` mode requires the configured
+    admin X-API-Key (fail-closed when none is configured).
+    """
+    if not resource_server.enabled:
+        require_admin_api_key(api_key)
+        return "api-key-admin"
+    principal = authenticate(api_key, authorization)
+    if principal is None or settings.hitl_approver_scope not in principal.scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Approvals require the '{settings.hitl_approver_scope}' scope.",
+        )
+    return principal.agent_id
+
+
+Approver = Annotated[str, Depends(require_approver)]
+
+
+@app.get(
+    "/api/v1/approvals",
+    response_model=list[HitlApproval],
+    tags=["HITL Approvals"],
+)
+def list_approvals(
+    _approver: Approver,
+    approval_status: Annotated[ApprovalStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIST_LIMIT)] = 100,
+) -> list[HitlApproval]:
+    """Return HITL approval requests (newest first), optionally by status."""
+    return firewall.approvals.list_requests(approval_status, limit)
+
+
+@app.post(
+    "/api/v1/approvals/{approval_id}",
+    response_model=HitlApproval,
+    tags=["HITL Approvals"],
+)
+def resolve_approval(
+    approval_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    resolution: ApprovalResolution,
+    approver: Approver,
+) -> HitlApproval:
+    """Approve or deny a pending request and ledger the decision."""
+    try:
+        approval = firewall.approvals.resolve(
+            approval_id, resolution.status, approver, resolution.reason
+        )
+    except ApprovalNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval request not found.",
+        ) from exc
+    except ApprovalConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Approval request is already {exc}.",
+        ) from exc
+    firewall.record_approval_event(approval)
+    logger.warning(
+        "HITL approval %s %s by %s (tool=%s server=%s)",
+        sanitize_log_value(approval.id),
+        sanitize_log_value(approval.status),
+        sanitize_log_value(approver),
+        sanitize_log_value(approval.tool_name),
+        sanitize_log_value(approval.server_name),
+    )
+    return approval
+
+
 async def read_body_capped(request: Request, limit: int) -> bytes:
     """Read at most ``limit + 1`` bytes so oversized bodies are never buffered."""
     buffer = bytearray()
@@ -331,6 +625,7 @@ async def mcp_jsonrpc_proxy(
     x_aegis_agent_id: str | None = Header(default=None),
     x_aegis_mcp_server: str | None = Header(default=None),
     x_aegis_environment: str | None = Header(default=None),
+    x_aegis_session_id: str | None = Header(default=None),
 ) -> JSONResponse:
     """Firewall, audit, and proxy a JSON-RPC 2.0 MCP request to its upstream.
 
@@ -342,8 +637,15 @@ async def mcp_jsonrpc_proxy(
         "agent_id": principal.agent_id if principal else x_aegis_agent_id,
         "server_name": x_aegis_mcp_server,
         "environment": x_aegis_environment,
+        "session_id": x_aegis_session_id,
     }
-    payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
+    with get_tracer().start_as_current_span(
+        "mcp.proxy jsonrpc",
+        attributes=mcp_attributes(
+            x_aegis_mcp_server, x_aegis_session_id, **{"network.transport": "http"}
+        ),
+    ):
+        payload = await run_in_threadpool(jsonrpc_gateway.handle, raw, routing)
     return JSONResponse(payload)
 
 
@@ -357,6 +659,19 @@ def mcp_routing(principal: Principal | None, request: Request) -> dict[str, str 
         "server_name": headers.get("x-aegis-mcp-server"),
         "environment": headers.get("x-aegis-environment"),
     }
+
+
+def streamable_span_attributes(request: Request) -> dict[str, AttributeValue]:
+    """GenAI/MCP attributes of one Streamable HTTP exchange."""
+    headers = request.headers
+    return mcp_attributes(
+        headers.get("x-aegis-mcp-server"),
+        headers.get("mcp-session-id"),
+        **{
+            "network.transport": "http",
+            "mcp.protocol.version": headers.get("mcp-protocol-version"),
+        },
+    )
 
 
 def transport_response(reply: TransportReply) -> Response:
@@ -379,9 +694,12 @@ async def mcp_streamable_post(
 ) -> Response:
     """MCP Streamable HTTP: send JSON-RPC messages (JSON or SSE replies)."""
     raw = await read_body_capped(request, MAX_REQUEST_BYTES)
-    reply = await run_in_threadpool(
-        mcp_transport.post, request.headers, raw, mcp_routing(principal, request)
-    )
+    with get_tracer().start_as_current_span(
+        "mcp.streamable_http POST", attributes=streamable_span_attributes(request)
+    ):
+        reply = await run_in_threadpool(
+            mcp_transport.post, request.headers, raw, mcp_routing(principal, request)
+        )
     return transport_response(reply)
 
 
@@ -390,9 +708,12 @@ async def mcp_streamable_get(
     request: Request, principal: AuthenticatedPrincipal
 ) -> Response:
     """MCP Streamable HTTP: open the server-initiated SSE stream."""
-    reply = await run_in_threadpool(
-        mcp_transport.get, request.headers, mcp_routing(principal, request)
-    )
+    with get_tracer().start_as_current_span(
+        "mcp.streamable_http GET", attributes=streamable_span_attributes(request)
+    ):
+        reply = await run_in_threadpool(
+            mcp_transport.get, request.headers, mcp_routing(principal, request)
+        )
     return transport_response(reply)
 
 
@@ -401,7 +722,10 @@ async def mcp_streamable_delete(
     request: Request, principal: AuthenticatedPrincipal
 ) -> Response:
     """MCP Streamable HTTP: terminate the session."""
-    reply = await run_in_threadpool(
-        mcp_transport.delete, request.headers, mcp_routing(principal, request)
-    )
+    with get_tracer().start_as_current_span(
+        "mcp.streamable_http DELETE", attributes=streamable_span_attributes(request)
+    ):
+        reply = await run_in_threadpool(
+            mcp_transport.delete, request.headers, mcp_routing(principal, request)
+        )
     return transport_response(reply)

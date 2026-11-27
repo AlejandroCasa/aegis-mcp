@@ -1,0 +1,171 @@
+{{- include "aegis-mcp.validate" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "aegis-mcp.fullname" . }}
+  labels:
+    {{- include "aegis-mcp.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # Single writer: the SQLite hash chain forks with more than one replica.
+  replicas: 1
+  {{- end }}
+  serviceName: {{ include "aegis-mcp.fullname" . }}-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "aegis-mcp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "aegis-mcp.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "aegis-mcp.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: aegis-mcp
+          image: {{ include "aegis-mcp.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: AEGIS_DB_PATH
+              value: {{ printf "%s/%s" .Values.persistence.mountPath .Values.config.dbFile | quote }}
+            - name: AEGIS_ENVIRONMENT
+              value: {{ .Values.config.environment | quote }}
+            - name: AEGIS_POLICY_MODE
+              value: {{ .Values.config.policyMode | quote }}
+            - name: AEGIS_CHECKPOINT_SIGNING
+              value: {{ .Values.config.checkpointSigning | quote }}
+            - name: AEGIS_CHECKPOINT_INTERVAL
+              value: {{ .Values.config.checkpointInterval | quote }}
+            - name: AEGIS_LOG_FORMAT
+              value: {{ .Values.config.logFormat | quote }}
+            - name: AEGIS_AUTH_MODE
+              value: {{ .Values.config.authMode | quote }}
+            - name: AEGIS_MCP_UPSTREAMS
+              value: {{ .Values.config.mcpUpstreams | toJson | quote }}
+            - name: AEGIS_MCP_ALLOWED_ORIGINS
+              value: {{ .Values.config.mcpAllowedOrigins | toJson | quote }}
+            {{- with .Values.config.otelEndpoint }}
+            - name: AEGIS_OTEL_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.signingKey.existingSecret }}
+            - name: AEGIS_SIGNING_KEY_PATH
+              value: {{ printf "%s/%s" .Values.signingKey.mountPath .Values.signingKey.key | quote }}
+            {{- end }}
+            {{- if .Values.policy.existingConfigMap }}
+            - name: AEGIS_POLICY_PATH
+              value: {{ printf "%s/%s" .Values.policy.mountPath .Values.policy.key | quote }}
+            {{- end }}
+            {{- if .Values.apiKey.existingSecret }}
+            - name: AEGIS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.key }}
+            {{- end }}
+            {{- range $name, $value := .Values.config.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.signingKey.existingSecret }}
+            - name: signing-key
+              mountPath: {{ .Values.signingKey.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.policy.existingConfigMap }}
+            - name: policy
+              mountPath: {{ .Values.policy.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpVolume.sizeLimit }}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.signingKey.existingSecret }}
+        - name: signing-key
+          secret:
+            secretName: {{ .Values.signingKey.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.signingKey.key }}
+                path: {{ .Values.signingKey.key }}
+        {{- end }}
+        {{- if .Values.policy.existingConfigMap }}
+        - name: policy
+          configMap:
+            name: {{ .Values.policy.existingConfigMap }}
+            items:
+              - key: {{ .Values.policy.key }}
+                path: {{ .Values.policy.key }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  persistentVolumeClaimRetentionPolicy:
+    # Never delete the audit ledger with the release.
+    whenDeleted: Retain
+    whenScaled: Retain
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "aegis-mcp.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

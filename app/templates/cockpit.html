@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Aegis-MCP Security Cockpit</title>
+  <link rel="stylesheet" href="/static/css/cockpit.css">
+  <script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#ledger">Skip to audit ledger</a>
+
+  <header class="masthead">
+    <div class="masthead__brand">
+      <p class="eyebrow">Aegis-MCP</p>
+      <h1 class="masthead__title">Security Cockpit</h1>
+      <p class="masthead__lede">Zero-trust decisions, DLP redactions and the tamper-evident audit chain of every MCP tool call.</p>
+    </div>
+
+    <form class="keybar" id="key-form" autocomplete="off" aria-label="Operator credentials">
+      <label class="keybar__label" for="api-key">X-API-Key</label>
+      <input class="keybar__input" id="api-key" name="api-key" type="password"
+             spellcheck="false" autocomplete="off" placeholder="Session only, never persisted">
+      <button class="btn btn--primary" type="submit">Use key</button>
+      <button class="btn btn--ghost" type="button" id="key-clear">Forget</button>
+      <p class="keybar__hint" id="key-status" aria-live="polite">No key in this session.</p>
+    </form>
+  </header>
+
+  <div class="toolbar" role="toolbar" aria-label="Cockpit controls">
+    <button class="btn" type="button" id="refresh">Refresh</button>
+    <label class="toggle">
+      <input type="checkbox" id="auto-refresh" checked>
+      <span>Live (10 s)</span>
+    </label>
+    <p class="toolbar__updated" id="updated-at">Not yet loaded</p>
+  </div>
+
+  <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
+
+  <main class="layout">
+    <section class="kpis" aria-labelledby="kpi-heading">
+      <h2 class="section-title" id="kpi-heading">Security posture</h2>
+      <dl class="kpi-strip" id="kpi-strip">
+        <div class="kpi"><dt>Requests</dt><dd data-kpi="requests">--</dd></div>
+        <div class="kpi kpi--allowed"><dt>Allowed</dt><dd data-kpi="allowed">--</dd></div>
+        <div class="kpi kpi--sanitized"><dt>Sanitized</dt><dd data-kpi="sanitized">--</dd></div>
+        <div class="kpi kpi--blocked"><dt>Blocked</dt><dd data-kpi="blocked">--</dd></div>
+        <div class="kpi"><dt>DLP redactions</dt><dd data-kpi="redactions">--</dd></div>
+        <div class="kpi"><dt>Policy mode</dt><dd data-kpi="mode">--</dd></div>
+        <div class="kpi"><dt>Rate anomalies</dt><dd data-kpi="anomalies">--</dd></div>
+        <div class="kpi"><dt>Ledger entries</dt><dd data-kpi="entries">--</dd></div>
+      </dl>
+      <p class="kpi-detail" id="kpi-detail"></p>
+    </section>
+
+    <section class="panel panel--ledger" id="ledger" aria-labelledby="ledger-heading">
+      <header class="panel__head">
+        <h2 class="section-title" id="ledger-heading">Live decisions &amp; audit ledger</h2>
+        <p class="panel__meta">Newest 50 entries</p>
+      </header>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">#</th>
+              <th scope="col">Time (UTC)</th>
+              <th scope="col">Agent / tool</th>
+              <th scope="col">Decision</th>
+              <th scope="col" class="num">Risk</th>
+              <th scope="col">Violations</th>
+              <th scope="col">Session / policy</th>
+              <th scope="col"><span class="visually-hidden">Proof</span></th>
+            </tr>
+          </thead>
+          <tbody id="ledger-body">
+            <tr><td colspan="8" class="empty">Loading ledger</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--chain" aria-labelledby="chain-heading">
+      <header class="panel__head">
+        <h2 class="section-title" id="chain-heading">Hash-chain &amp; Merkle inspector</h2>
+      </header>
+      <div class="chain-actions">
+        <button class="btn btn--primary" type="button" id="verify-chain">Verify chain</button>
+        <form class="proof-form" id="proof-form" aria-label="Merkle inclusion proof">
+          <label for="proof-id">Entry</label>
+          <input id="proof-id" name="proof-id" type="number" min="1" step="1" inputmode="numeric" required>
+          <button class="btn" type="submit">Check proof</button>
+        </form>
+      </div>
+      <div class="verdict" id="chain-result" aria-live="polite">
+        <p class="verdict__idle">Run a verification to recompute every SHA-256 link.</p>
+      </div>
+      <div class="verdict" id="proof-result" aria-live="polite" hidden></div>
+      <h3 class="subsection-title">Signed checkpoints</h3>
+      <ol class="checkpoints" id="checkpoints">
+        <li class="empty">Loading checkpoints</li>
+      </ol>
+    </section>
+
+    <section class="panel panel--toolguard" aria-labelledby="toolguard-heading">
+      <header class="panel__head">
+        <h2 class="section-title" id="toolguard-heading">ToolGuard inventory</h2>
+        <p class="panel__meta">Pinned definition fingerprints</p>
+      </header>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Server</th>
+              <th scope="col">Definition</th>
+              <th scope="col">State</th>
+              <th scope="col">Fingerprint</th>
+              <th scope="col"><span class="visually-hidden">Action</span></th>
+            </tr>
+          </thead>
+          <tbody id="toolguard-body">
+            <tr><td colspan="5" class="empty">Requires the admin X-API-Key</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--hitl" aria-labelledby="hitl-heading">
+      <header class="panel__head">
+        <h2 class="section-title" id="hitl-heading">HITL approval queue</h2>
+        <p class="panel__meta">Pending and recent requests</p>
+      </header>
+      <ul class="approvals" id="approvals">
+        <li class="empty">Requires the admin X-API-Key</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="colophon">
+    <p>Aegis-MCP &middot; RFC 6962 Merkle audit &middot; Ed25519 signed tree heads &middot;
+      <a href="/docs">API reference</a> &middot; <a href="/metrics">Prometheus metrics</a></p>
+  </footer>
+</body>
+</html>

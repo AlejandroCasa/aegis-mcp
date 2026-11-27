@@ -14,6 +14,12 @@ from pydantic import (
 Environment = Literal["dev", "staging", "prod"]
 PolicyMode = Literal["enforce", "monitor"]
 Decision = Literal["ALLOWED", "SANITIZED", "BLOCKED"]
+TaintRole = Literal["untrusted_content", "private_data", "egress_sink"]
+TaintLabel = Literal["untrusted_content", "private_data"]
+PolicyAction = Literal["allow", "deny", "require_approval"]
+ApprovalStatus = Literal["pending", "approved", "denied", "expired"]
+ApprovalId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
+"""Opaque HITL approval identifier (UUID4 hex)."""
 
 GlobPattern = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 """Case-sensitive ``fnmatch`` glob (``*``, ``?``, ``[seq]``) for RBAC matching."""
@@ -56,6 +62,15 @@ class MCPToolCallRequest(BaseModel):
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="UTC timestamp of the tool invocation.",
+    )
+    session_id: str = Field(
+        default="",
+        max_length=1024,
+        description="Optional agent session for toxic-flow taint tracking.",
+    )
+    approval_id: ApprovalId | None = Field(
+        default=None,
+        description="HITL approval to redeem for a ``require_approval`` call.",
     )
 
 
@@ -111,6 +126,14 @@ class MCPInspectionResponse(BaseModel):
     policy_version: str = Field(
         default="",
         description="SHA-256 (RFC 8785 JCS) of the policy document that decided.",
+    )
+    approval_id: str | None = Field(
+        default=None,
+        description="HITL approval request bound to this call, if any.",
+    )
+    approval_status: ApprovalStatus | None = Field(
+        default=None,
+        description="Status of the bound HITL approval request.",
     )
 
 
@@ -183,12 +206,51 @@ class ChainVerificationResponse(BaseModel):
     )
 
 
+class SignedCheckpoint(BaseModel):
+    """Ed25519 Signed Tree Head over the RFC 6962 Merkle tree of the ledger."""
+
+    tree_size: int = Field(..., ge=0, description="Entries committed to.")
+    root_hash: str = Field(..., description="RFC 6962 Merkle Tree Hash (hex).")
+    timestamp: str = Field(..., description="ISO-8601 UTC signing time.")
+    prev_checkpoint_hash: str = Field(
+        ..., description="Checkpoint hash of the previous tree head (hex)."
+    )
+    checkpoint_hash: str = Field(
+        ..., description="SHA-256 of the signed canonical tree head (hex)."
+    )
+    algorithm: Literal["Ed25519"] = "Ed25519"
+    signature: str = Field(..., description="Ed25519 signature (hex).")
+    public_key: str = Field(..., description="Raw Ed25519 public key (hex).")
+    key_fingerprint: str = Field(
+        ..., description="SHA-256 fingerprint of the public key (hex)."
+    )
+
+
+class InclusionProofResponse(BaseModel):
+    """RFC 6962 Merkle inclusion proof of one audit ledger entry."""
+
+    entry_id: int = Field(..., description="Ledger entry ID.")
+    leaf_index: int = Field(..., ge=0, description="0-based Merkle leaf index.")
+    tree_size: int = Field(..., ge=1, description="Size of the proven tree.")
+    entry_hash: str = Field(..., description="Entry hash used as Merkle leaf.")
+    root_hash: str = Field(..., description="Merkle Tree Hash the proof targets.")
+    audit_path: list[str] = Field(
+        default_factory=list, description="Sibling hashes, leaf to root (hex)."
+    )
+    checkpoint: SignedCheckpoint | None = Field(
+        default=None,
+        description="Signed Tree Head of ``tree_size`` (absent when unsigned).",
+    )
+
+
 class PolicyRule(BaseModel):
     """A single RBAC matrix row scoped by agent, server, and environment.
 
     A rule applies when ``agent_id`` and ``server_name`` glob-match the call and
     the call's environment is listed. ``deny_tools`` always win; a non-empty
     ``allow_tools`` turns the rule into an allowlist for the matched scope.
+    ``require_approval_tools`` gate matching tools behind a human-in-the-loop
+    approval (and satisfy any allowlist in scope).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -217,12 +279,20 @@ class PolicyRule(BaseModel):
         max_length=512,
         description="Tool-name globs always denied for the matched scope.",
     )
+    require_approval_tools: list[GlobPattern] = Field(
+        default_factory=list,
+        max_length=512,
+        description="Tool-name globs requiring human approval in the scope.",
+    )
 
     @model_validator(mode="after")
     def _require_effect(self) -> "PolicyRule":
-        """Reject no-op rules (e.g. a typo leaving both tool lists empty)."""
-        if not self.allow_tools and not self.deny_tools:
-            raise ValueError("RBAC rule must declare allow_tools or deny_tools.")
+        """Reject no-op rules (e.g. a typo leaving every tool list empty)."""
+        if not (self.allow_tools or self.deny_tools or self.require_approval_tools):
+            raise ValueError(
+                "RBAC rule must declare allow_tools, deny_tools or "
+                "require_approval_tools."
+            )
         return self
 
 
@@ -360,12 +430,147 @@ class PolicyStatus(BaseModel):
     )
 
 
+class ToolTaintRule(BaseModel):
+    """Declarative toxic-flow taint classification for matching tools.
+
+    Every matching rule contributes its ``roles`` (union); explicit rules are
+    combined with the built-in heuristics unless those are disabled.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_name: GlobPattern = Field(default="*", description="Server glob.")
+    tool_name: GlobPattern = Field(default="*", description="Tool-name glob.")
+    environments: list[Environment] = Field(
+        default_factory=_all_environments, min_length=1, max_length=3
+    )
+    roles: list[TaintRole] = Field(
+        ...,
+        min_length=1,
+        max_length=3,
+        description="untrusted_content | private_data | egress_sink.",
+    )
+
+
+MAX_VELOCITY_READS = 4096
+MAX_VELOCITY_WINDOW_SECONDS = 3600.0
+
+
+class TokenBucketLimit(BaseModel):
+    """Token-bucket rate limit for one ``(agent, server, tool)`` key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capacity: float = Field(..., gt=0, le=1_000_000, description="Burst size.")
+    refill_per_sec: float = Field(
+        ..., ge=0, le=1_000_000, description="Tokens restored per second."
+    )
+
+
+class VelocityLimit(BaseModel):
+    """Sliding-window cap on sensitive reads per ``(session, agent)``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_seconds: float = Field(
+        ..., gt=0, le=MAX_VELOCITY_WINDOW_SECONDS, description="Window length."
+    )
+    max_reads: int = Field(
+        ..., ge=1, le=MAX_VELOCITY_READS, description="Reads allowed per window."
+    )
+
+
+class ToolRateLimit(BaseModel):
+    """Declarative rate / exfiltration-velocity override for matching tools.
+
+    The first matching rule wins. ``rate_limit`` and ``velocity_limit``
+    replace the global ``AEGIS_RATE_LIMIT_*`` / ``AEGIS_VELOCITY_*`` defaults;
+    ``sensitive_read`` forces (``true``) or exempts (``false``) the tool from
+    velocity accounting regardless of the built-in heuristics. A rule with a
+    ``velocity_limit`` and no explicit ``sensitive_read`` marks the tool as a
+    sensitive read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_name: GlobPattern = Field(default="*", description="Server glob.")
+    tool_name: GlobPattern = Field(default="*", description="Tool-name glob.")
+    environments: list[Environment] = Field(
+        default_factory=_all_environments, min_length=1, max_length=3
+    )
+    rate_limit: TokenBucketLimit | None = Field(default=None)
+    velocity_limit: VelocityLimit | None = Field(default=None)
+    sensitive_read: bool | None = Field(default=None)
+
+
+class RateLimitStats(BaseModel):
+    """Operational snapshot of the behavioral rate limiter."""
+
+    enabled: bool = Field(..., description="AEGIS_RATE_LIMIT_ENABLED.")
+    capacity: float = Field(..., description="Default token-bucket capacity.")
+    refill_per_sec: float = Field(..., description="Default refill rate.")
+    velocity_window_seconds: float = Field(..., description="Default window.")
+    velocity_max_reads: int = Field(..., description="Default reads per window.")
+    tracked_buckets: int = Field(..., description="Live token buckets.")
+    tracked_sessions: int = Field(..., description="Live velocity windows.")
+    rate_limited_total: int = Field(..., description="Token-bucket denials.")
+    velocity_anomalies_total: int = Field(..., description="Velocity anomalies.")
+
+
+class CockpitSummary(BaseModel):
+    """Security posture KPIs rendered by the operator cockpit (``GET /``)."""
+
+    requests_total: int = Field(..., ge=0, description="Inspected MCP calls.")
+    decisions: dict[str, int] = Field(
+        default_factory=dict, description="Inspected calls per firewall decision."
+    )
+    blocked_rule_hits: int = Field(..., ge=0, description="Blocking rule matches.")
+    redactions_total: int = Field(..., ge=0, description="DLP redactions applied.")
+    redactions: dict[str, int] = Field(
+        default_factory=dict, description="DLP redactions per category."
+    )
+    shadow_would_block: int = Field(
+        ..., ge=0, description="Monitor-mode calls enforce mode would block."
+    )
+    rate_anomalies_total: int = Field(..., ge=0, description="Rate anomalies.")
+    rate_anomalies: dict[str, int] = Field(
+        default_factory=dict, description="Rate anomalies per kind."
+    )
+    ledger_errors: int = Field(..., ge=0, description="Ledger integrity failures.")
+    ledger_entries: int = Field(..., ge=0, description="Persisted ledger rows.")
+    policy_mode: PolicyMode = Field(..., description="enforce|monitor.")
+    policy_version: str = Field(..., description="SHA-256 of the active policy.")
+    environment: Environment = Field(..., description="Gateway deployment env.")
+    fail_closed: bool = Field(..., description="Startup deny-all fallback active.")
+    rate_limit_enabled: bool = Field(..., description="AEGIS_RATE_LIMIT_ENABLED.")
+    auth_mode: str = Field(..., description="api_key|oauth.")
+    api_key_required: bool = Field(
+        ..., description="True when AEGIS_API_KEY is configured."
+    )
+
+
+class SessionTaintStatus(BaseModel):
+    """Toxic-flow taint state of one agent session (observability)."""
+
+    session_id: str = Field(..., description="Agent / MCP session identifier.")
+    labels: list[TaintLabel] = Field(
+        default_factory=list, description="Taint labels held by the session."
+    )
+    lethal_trifecta_armed: bool = Field(
+        ..., description="True when any egress sink would now be denied."
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Bounded provenance (``<tool>:<label>``), oldest first.",
+    )
+
+
 class PolicyDocument(BaseModel):
     """Declarative RBAC policy matrix applied to every MCP tool call."""
 
     model_config = ConfigDict(extra="forbid")
 
-    default_action: Literal["allow", "deny"] = Field(
+    default_action: PolicyAction = Field(
         default="allow",
         description="Decision applied when no matching rule declares an allowlist.",
     )
@@ -379,3 +584,46 @@ class PolicyDocument(BaseModel):
         max_length=1024,
         description="Argument-level ABAC constraints (all matching apply).",
     )
+    taint_rules: list[ToolTaintRule] = Field(
+        default_factory=list,
+        max_length=1024,
+        description="Toxic-flow taint classification (lethal trifecta defense).",
+    )
+    rate_limits: list[ToolRateLimit] = Field(
+        default_factory=list,
+        max_length=1024,
+        description="Rate-limit / exfiltration-velocity overrides (first match).",
+    )
+
+
+class HitlApproval(BaseModel):
+    """A human-in-the-loop approval request for a ``require_approval`` call."""
+
+    id: str = Field(..., description="Approval identifier (UUID4 hex).")
+    agent_id: str = Field(..., description="Requesting agent.")
+    server_name: str = Field(..., description="Target MCP server.")
+    tool_name: str = Field(..., description="Gated tool.")
+    environment: str = Field(..., description="Deployment environment.")
+    arguments_hash: str = Field(..., description="JCS SHA-256 of the arguments.")
+    sanitized_arguments: dict[str, Any] = Field(
+        default_factory=dict, description="DLP-redacted arguments for review."
+    )
+    session_id: str = Field(default="", description="Agent session, if any.")
+    status: ApprovalStatus = Field(..., description="Lifecycle status.")
+    created_at: str = Field(..., description="ISO-8601 UTC creation time.")
+    expires_at: str = Field(..., description="ISO-8601 UTC expiry (TTL bound).")
+    resolved_by: str | None = Field(default=None, description="Resolver identity.")
+    resolved_at: str | None = Field(default=None, description="Resolution time.")
+    reason: str | None = Field(default=None, description="Resolution reason.")
+    consumed_at: str | None = Field(
+        default=None, description="Single-use redemption time of an approval."
+    )
+
+
+class ApprovalResolution(BaseModel):
+    """Operator decision on a pending HITL approval request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["approved", "denied"] = Field(..., description="Decision.")
+    reason: str | None = Field(default=None, max_length=1024)

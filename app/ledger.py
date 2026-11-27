@@ -23,17 +23,35 @@ link after the first v2 link (no downgrade attacks) or unknown versions.
 The database runs in WAL mode (``AEGIS_LEDGER_WAL``) so readers never block
 the single writer; appends take ``BEGIN IMMEDIATE`` before reading the head
 so concurrent writers can never fork the chain.
+
+**Merkle checkpoints** (``merkle_checkpoints`` table): with a
+``CheckpointSigner`` the ledger signs an RFC 6962 Signed Tree Head over all
+entry hashes every ``checkpoint_interval`` appends (inside the append
+transaction, so a checkpoint always covers a consistent prefix) or on
+demand, and serves O(log n) inclusion proofs (see ``app/merkle.py``).
 """
 
+import bisect
 import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from app.canonical import sha256_hex
+from app.merkle import (
+    GENESIS_CHECKPOINT_HASH,
+    CheckpointSigner,
+    SignedTreeHead,
+    TreeHead,
+    inclusion_proof,
+    merkle_root,
+)
+from app.metrics import metrics_registry
 from app.schemas import AuditEntry, ChainVerificationResponse, Decision, PolicyMode
 
 GENESIS_HASH = "0" * 64
@@ -95,6 +113,70 @@ V2_FIELDS = (
     "would_block",
     "session_id",
 )
+
+CHECKPOINTS_DDL = """
+    CREATE TABLE IF NOT EXISTS merkle_checkpoints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tree_size INTEGER NOT NULL,
+        last_entry_id INTEGER NOT NULL,
+        root_hash TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        prev_checkpoint_hash TEXT NOT NULL,
+        checkpoint_hash TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        key_fingerprint TEXT NOT NULL
+    )
+"""
+_CHECKPOINT_SELECT = (
+    "SELECT tree_size, root_hash, timestamp, prev_checkpoint_hash, signature, "
+    "public_key FROM merkle_checkpoints"
+)
+_CHECKPOINT_INSERT = (
+    "INSERT INTO merkle_checkpoints (tree_size, last_entry_id, root_hash, "
+    "timestamp, prev_checkpoint_hash, checkpoint_hash, signature, public_key, "
+    "key_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+@dataclass(frozen=True)
+class ProofBundle:
+    """RFC 6962 inclusion proof of one ledger entry against a tree head."""
+
+    entry_id: int
+    leaf_index: int
+    tree_size: int
+    entry_hash: str
+    root_hash: str
+    audit_path: list[str]
+    checkpoint: SignedTreeHead | None
+
+
+def leaf_bytes(entry_hash: str) -> bytes:
+    """Merkle leaf for an entry: its raw 32-byte hash (UTF-8 if not hex)."""
+    try:
+        return bytes.fromhex(entry_hash)
+    except ValueError:
+        return entry_hash.encode("utf-8")
+
+
+def _row_to_checkpoint(row: tuple[Any, ...]) -> SignedTreeHead:
+    """Convert a ``_CHECKPOINT_SELECT`` row into a SignedTreeHead."""
+    head = TreeHead(int(row[0]), str(row[1]), str(row[2]), str(row[3]))
+    return SignedTreeHead(head=head, signature=str(row[4]), public_key=str(row[5]))
+
+
+def _covers(checkpoint: SignedTreeHead | None, leaf_index: int) -> bool:
+    """True when ``checkpoint`` commits to the leaf at ``leaf_index``."""
+    return checkpoint is not None and checkpoint.head.tree_size > leaf_index
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    """True when ``name`` exists (older ledgers have no checkpoint table)."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone()
+    return row is not None
 
 
 @dataclass(frozen=True)
@@ -254,15 +336,36 @@ def _row_to_entry(row: tuple[Any, ...]) -> AuditEntry:
 class AuditLedger:
     """SQLite-backed, hash-chained audit ledger."""
 
-    def __init__(self, db_path: str, wal: bool = True) -> None:
-        """Bind the ledger to ``db_path`` (call ``init`` to create/migrate)."""
+    def __init__(
+        self,
+        db_path: str,
+        wal: bool = True,
+        signer: CheckpointSigner | None = None,
+        checkpoint_interval: int = 0,
+        read_only: bool = False,
+    ) -> None:
+        """Bind the ledger to ``db_path`` (call ``init`` to create/migrate).
+
+        ``signer`` enables Signed Tree Heads; ``checkpoint_interval`` > 0
+        signs one automatically every that many appends. ``read_only``
+        opens SQLite in ``mode=ro`` (offline verification of evidence).
+        """
         self.db_path = db_path
         self.wal = wal
+        self.signer = signer
+        self.checkpoint_interval = checkpoint_interval
+        self.read_only = read_only
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """Yield an autocommit connection that is always closed."""
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        if self.read_only:
+            uri = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, isolation_level=None, uri=True)
+        else:
+            conn = sqlite3.connect(self.db_path, isolation_level=None)
+            if self.wal:
+                conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
         finally:
@@ -289,6 +392,7 @@ class AuditLedger:
                     timestamp TEXT NOT NULL
                 )
                 """)
+            conn.execute(CHECKPOINTS_DDL)
             self._migrate(conn)
 
     @staticmethod
@@ -317,11 +421,160 @@ class AuditLedger:
                 prev_hash = str(row[0]) if row else GENESIS_HASH
                 entry_hash = compute_entry_hash_v2(prev_hash, record)
                 conn.execute(_INSERT, _insert_values(record, prev_hash, entry_hash))
+                self._auto_checkpoint(conn)
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
         return prev_hash, entry_hash
+
+    def _auto_checkpoint(self, conn: sqlite3.Connection) -> None:
+        """Sign a checkpoint once ``checkpoint_interval`` entries are pending.
+
+        Pending entries are counted by rowid range after the last
+        checkpoint, so the check stays O(interval) however long the chain.
+        """
+        if self.signer is None or self.checkpoint_interval <= 0:
+            return
+        row = conn.execute(
+            "SELECT last_entry_id FROM merkle_checkpoints ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        last_entry_id = int(row[0]) if row else 0
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM audit_ledger WHERE id > ?", (last_entry_id,)
+        ).fetchone()[0]
+        if int(pending) >= self.checkpoint_interval:
+            self._sign_checkpoint(conn, self.signer)
+
+    @staticmethod
+    def _latest_checkpoint(conn: sqlite3.Connection) -> SignedTreeHead | None:
+        """Most recent checkpoint, if any (``None`` on pre-checkpoint ledgers)."""
+        if not _has_table(conn, "merkle_checkpoints"):
+            return None
+        row = conn.execute(_CHECKPOINT_SELECT + " ORDER BY id DESC LIMIT 1").fetchone()
+        return _row_to_checkpoint(row) if row else None
+
+    def _sign_checkpoint(
+        self, conn: sqlite3.Connection, signer: CheckpointSigner
+    ) -> SignedTreeHead:
+        """Sign a checkpoint; failures count as ``checkpoint_error`` and re-raise."""
+        try:
+            return self._sign_tree_head(conn, signer)
+        except Exception:
+            metrics_registry.record_ledger_error("checkpoint_error")
+            raise
+
+    def _sign_tree_head(
+        self, conn: sqlite3.Connection, signer: CheckpointSigner
+    ) -> SignedTreeHead:
+        """Sign a Signed Tree Head over every entry (caller holds the lock)."""
+        rows = conn.execute(
+            "SELECT id, entry_hash FROM audit_ledger ORDER BY id ASC"
+        ).fetchall()
+        latest = self._latest_checkpoint(conn)
+        if latest is not None and latest.head.tree_size == len(rows):
+            return latest
+        head = TreeHead(
+            tree_size=len(rows),
+            root_hash=merkle_root([leaf_bytes(str(row[1])) for row in rows]).hex(),
+            timestamp=datetime.now(UTC).isoformat(),
+            prev_checkpoint_hash=(
+                latest.head.digest() if latest else GENESIS_CHECKPOINT_HASH
+            ),
+        )
+        signed = signer.sign(head)
+        conn.execute(
+            _CHECKPOINT_INSERT,
+            (
+                head.tree_size,
+                int(rows[-1][0]) if rows else 0,
+                head.root_hash,
+                head.timestamp,
+                head.prev_checkpoint_hash,
+                head.digest(),
+                signed.signature,
+                signed.public_key,
+                signed.key_fingerprint,
+            ),
+        )
+        return signed
+
+    def create_checkpoint(self) -> SignedTreeHead | None:
+        """Sign a checkpoint over the current tree now (``None`` w/o signer).
+
+        Returns the latest checkpoint unchanged when it already covers every
+        entry, so on-demand triggers never produce duplicate tree heads.
+        """
+        if self.signer is None:
+            return None
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                signed = self._sign_checkpoint(conn, self.signer)
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+        return signed
+
+    def list_checkpoints(self) -> list[SignedTreeHead]:
+        """Every persisted checkpoint, oldest first."""
+        with self._connect() as conn:
+            if not _has_table(conn, "merkle_checkpoints"):
+                return []
+            rows = conn.execute(_CHECKPOINT_SELECT + " ORDER BY id ASC").fetchall()
+        return [_row_to_checkpoint(row) for row in rows]
+
+    def _proof_snapshot(
+        self,
+    ) -> tuple[list[tuple[int, str]], SignedTreeHead | None]:
+        """Entries and latest checkpoint read in one consistent snapshot."""
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                "SELECT id, entry_hash FROM audit_ledger ORDER BY id ASC"
+            ).fetchall()
+            latest = self._latest_checkpoint(conn)
+            conn.execute("COMMIT")
+        return [(int(row[0]), str(row[1])) for row in rows], latest
+
+    def _covering_snapshot(
+        self,
+        index: int,
+        rows: list[tuple[int, str]],
+        latest: SignedTreeHead | None,
+    ) -> tuple[list[tuple[int, str]], SignedTreeHead | None]:
+        """Sign on demand when needed; drop a checkpoint not covering ``index``."""
+        if self.signer is not None and not _covers(latest, index):
+            self.create_checkpoint()
+            rows, latest = self._proof_snapshot()
+        return rows, latest if _covers(latest, index) else None
+
+    def inclusion_proof(self, entry_id: int) -> ProofBundle | None:
+        """RFC 6962 inclusion proof for ``entry_id`` (``None`` if unknown).
+
+        The proof targets the latest Signed Tree Head; when it does not cover
+        the entry yet and a signer is configured, a checkpoint is signed on
+        demand. Without any covering checkpoint the proof is computed against
+        the current (unsigned) tree.
+        """
+        rows, latest = self._proof_snapshot()
+        ids = [row[0] for row in rows]
+        index = bisect.bisect_left(ids, entry_id)
+        if index == len(ids) or ids[index] != entry_id:
+            return None
+        rows, latest = self._covering_snapshot(index, rows, latest)
+        tree_size = latest.head.tree_size if latest else len(rows)
+        leaves = [leaf_bytes(row[1]) for row in rows[:tree_size]]
+        return ProofBundle(
+            entry_id=entry_id,
+            leaf_index=index,
+            tree_size=tree_size,
+            entry_hash=rows[index][1],
+            root_hash=merkle_root(leaves).hex(),
+            audit_path=[node.hex() for node in inclusion_proof(leaves, index)],
+            checkpoint=latest,
+        )
 
     def list_entries(self, agent_id: str | None = None) -> list[AuditEntry]:
         """Return persisted entries in chain order, optionally per agent."""
@@ -333,6 +586,20 @@ class AuditLedger:
                 ).fetchall()
             else:
                 rows = conn.execute(LEDGER_SELECT + " ORDER BY id ASC").fetchall()
+        return [_row_to_entry(row) for row in rows]
+
+    def count(self) -> int:
+        """Return the number of persisted ledger rows."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM audit_ledger").fetchone()
+        return int(row[0])
+
+    def list_recent(self, limit: int) -> list[AuditEntry]:
+        """Return the newest ``limit`` entries, newest first (bounded read)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                LEDGER_SELECT + " ORDER BY id DESC LIMIT ?", (max(1, limit),)
+            ).fetchall()
         return [_row_to_entry(row) for row in rows]
 
     def verify(self) -> ChainVerificationResponse:
@@ -360,9 +627,10 @@ class AuditLedger:
         )
 
     def reset(self) -> None:
-        """Delete every entry (deterministic test isolation)."""
+        """Delete every entry and checkpoint (deterministic test isolation)."""
         with self._connect() as conn:
             conn.execute("DELETE FROM audit_ledger")
+            conn.execute("DELETE FROM merkle_checkpoints")
 
 
 def _legacy_count(entries: list[AuditEntry]) -> int:

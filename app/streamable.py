@@ -145,10 +145,16 @@ class SessionStore:
         ttl_seconds: float,
         capacity: int,
         clock: Callable[[], float] = time.monotonic,
+        on_remove: Callable[[str], None] | None = None,
     ) -> None:
-        """Configure the lifetime, capacity, and clock of the table."""
+        """Configure lifetime, capacity, clock, and the end-of-session hook.
+
+        ``on_remove(session_id)`` runs (outside the table lock) whenever a
+        session is terminated, expires, or is purged.
+        """
         self.ttl_seconds = ttl_seconds
         self.capacity = capacity
+        self.on_remove = on_remove
         self._clock = clock
         self._lock = threading.Lock()
         self._sessions: dict[str, tuple[McpSession, float]] = {}
@@ -157,37 +163,51 @@ class SessionStore:
         """Number of stored (possibly expired) sessions."""
         return len(self._sessions)
 
+    def _ended(self, session_ids: list[str]) -> None:
+        """Notify the end-of-session hook."""
+        if self.on_remove is not None:
+            for session_id in session_ids:
+                self.on_remove(session_id)
+
     def add(self, session: McpSession) -> None:
         """Store ``session``; ``503`` when the table is full of live sessions."""
         with self._lock:
             now = self._clock()
-            self._sessions = {
-                key: entry for key, entry in self._sessions.items() if entry[1] > now
-            }
-            if len(self._sessions) >= self.capacity:
-                raise TransportError(503, "MCP session capacity exhausted.")
-            self._sessions[session.session_id] = (session, now + self.ttl_seconds)
+            expired = [key for key, entry in self._sessions.items() if entry[1] <= now]
+            for key in expired:
+                del self._sessions[key]
+            full = len(self._sessions) >= self.capacity
+            if not full:
+                self._sessions[session.session_id] = (session, now + self.ttl_seconds)
+        self._ended(expired)
+        if full:
+            raise TransportError(503, "MCP session capacity exhausted.")
 
     def get(self, session_id: str) -> McpSession | None:
         """Return a live session and extend its lifetime, else None."""
         with self._lock:
             now = self._clock()
             entry = self._sessions.get(session_id)
-            if entry is None or entry[1] <= now:
-                self._sessions.pop(session_id, None)
-                return None
-            self._sessions[session_id] = (entry[0], now + self.ttl_seconds)
-            return entry[0]
+            if entry is not None and entry[1] > now:
+                self._sessions[session_id] = (entry[0], now + self.ttl_seconds)
+                return entry[0]
+            self._sessions.pop(session_id, None)
+        if entry is not None:
+            self._ended([session_id])
+        return None
 
     def remove(self, session_id: str) -> None:
         """Forget a session (no-op if unknown)."""
         with self._lock:
             self._sessions.pop(session_id, None)
+        self._ended([session_id])
 
     def clear(self) -> None:
         """Forget every session."""
         with self._lock:
+            ended = list(self._sessions)
             self._sessions.clear()
+        self._ended(ended)
 
 
 def check_origin(headers: Headers) -> None:
@@ -340,12 +360,18 @@ def upstream_messages(response: httpx.Response) -> Iterator[tuple[Any, str | Non
         yield message, None
 
 
-def server_message(message: Any) -> dict[str, Any] | None:
-    """DLP-redact a server-initiated request/notification (else None)."""
+def server_fields(message: Any) -> dict[str, Any] | None:
+    """Rebuild a server-initiated request/notification (else None)."""
     if not isinstance(message, dict) or not isinstance(message.get("method"), str):
         return None
     fields = {key: message[key] for key in ("id", "method", "params") if key in message}
-    return dict(redact_value({"jsonrpc": "2.0", **fields}))
+    return {"jsonrpc": "2.0", **fields}
+
+
+def server_message(message: Any) -> dict[str, Any] | None:
+    """DLP-redact a server-initiated request/notification (else None)."""
+    fields = server_fields(message)
+    return None if fields is None else dict(redact_value(fields))
 
 
 def _one_way_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -367,10 +393,16 @@ class StreamableHttpTransport:
     def __init__(
         self, gateway: JsonRpcGateway, sessions: SessionStore | None = None
     ) -> None:
-        """Bind the gateway (pipeline + HTTP client) and the session table."""
+        """Bind the gateway (pipeline + HTTP client) and the session table.
+
+        Ending a session (``DELETE``, expiry, upstream ``404``) also clears
+        its toxic-flow taint.
+        """
         self.gateway = gateway
         self.sessions = sessions or SessionStore(
-            settings.mcp_session_ttl_seconds, settings.mcp_max_sessions
+            settings.mcp_session_ttl_seconds,
+            settings.mcp_max_sessions,
+            on_remove=gateway.firewall.taint.clear_session,
         )
 
     # -- HTTP methods -------------------------------------------------------
@@ -398,7 +430,7 @@ class StreamableHttpTransport:
             response = self._open_server_stream(session, headers)
         except TransportError as exc:
             return exc.reply()
-        return TransportReply(200, stream=self._server_stream(response))
+        return TransportReply(200, stream=self._server_stream(session, response))
 
     def delete(self, headers: Headers, routing: Routing) -> TransportReply:
         """Handle ``DELETE /mcp``: terminate the session."""
@@ -616,7 +648,7 @@ class StreamableHttpTransport:
     ) -> tuple[dict[str, Any] | None, bool]:
         """Return ``(message to relay or None, is_final_response)``."""
         if isinstance(message, dict) and "method" in message:
-            return server_message(message), False
+            return self._server_message(context, message), False
         if not isinstance(message, dict) or not _is_reply_to(message, envelope):
             return None, False
         try:
@@ -659,13 +691,23 @@ class StreamableHttpTransport:
             )
         return response
 
-    @staticmethod
-    def _server_stream(response: httpx.Response) -> Iterator[bytes]:
+    def _server_message(
+        self, context: CallContext, message: Any
+    ) -> dict[str, Any] | None:
+        """``server_message`` with outbound-DLP ``private_data`` promotion."""
+        fields = server_fields(message)
+        if fields is None:
+            return None
+        return dict(self.gateway.redact_reply(context, fields["method"], fields))
+
+    def _server_stream(
+        self, session: McpSession, response: httpx.Response
+    ) -> Iterator[bytes]:
         """Relay server-initiated messages with per-event DLP."""
         try:
             with contextlib.suppress(*RELAY_FAILURES):
                 for message, event_id in upstream_messages(response):
-                    relayed = server_message(message)
+                    relayed = self._server_message(session.context, message)
                     if relayed is not None:
                         yield format_sse(relayed, event_id)
         finally:

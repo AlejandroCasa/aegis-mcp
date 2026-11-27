@@ -310,6 +310,8 @@ def test_get_policies_returns_active_matrix() -> None:
         "default_action": "allow",
         "rules": [],
         "tool_constraints": [],
+        "taint_rules": [],
+        "rate_limits": [],
     }
 
 

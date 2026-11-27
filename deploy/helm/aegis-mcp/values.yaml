@@ -1,0 +1,182 @@
+# -----------------------------------------------------------------------------
+# Aegis-MCP Helm values — hardened, single-writer defaults.
+# -----------------------------------------------------------------------------
+
+image:
+  repository: ghcr.io/alejandrocasa/aegis-mcp
+  # Defaults to .Chart.AppVersion when empty.
+  tag: ""
+  # Immutable image digest (sha256:...). When set it wins over `tag`; prefer
+  # pinning the cosign-signed digest published by the release workflow.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# The SQLite audit ledger is a single-writer, hash-chained log. Exactly ONE
+# replica is supported: a second writer would append to its own copy of the
+# chain and fork it irrecoverably. The StatefulSet template refuses any other
+# value until the `[persistence/postgres-ledger]` backend exists.
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  # Generated from the fullname template when empty.
+  name: ""
+  annotations: {}
+  # The gateway never talks to the Kubernetes API.
+  automountServiceAccountToken: false
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: "/metrics"
+podLabels: {}
+
+# Pod Security Standards: "restricted" profile.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 2
+
+# Persistent volume for the SQLite audit ledger (mounted at /data, the only
+# writable path besides the /tmp emptyDir under a read-only root filesystem).
+persistence:
+  enabled: true
+  # Empty uses the cluster default StorageClass.
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  mountPath: /data
+
+tmpVolume:
+  sizeLimit: 64Mi
+
+# Gateway configuration rendered as AEGIS_* environment variables.
+config:
+  # `prod` fails closed: deny-all without a valid policy, and startup aborts
+  # when checkpoint signing is enabled without a signing key.
+  environment: prod
+  policyMode: enforce
+  dbFile: aegis.db
+  checkpointSigning: true
+  checkpointInterval: 50
+  logFormat: json
+  authMode: api_key
+  # Upstream MCP servers ({name: url}); rendered as JSON into
+  # AEGIS_MCP_UPSTREAMS. Remember to open egress for them below.
+  mcpUpstreams: {}
+  mcpAllowedOrigins: []
+  # OTLP/HTTP collector base URL (e.g. http://otel-collector.observability:4318).
+  otelEndpoint: ""
+  # Extra plain AEGIS_* variables ({AEGIS_RATE_LIMIT_CAPACITY: "120"}).
+  extraEnv: {}
+
+# Operator API key (X-API-Key) from an existing Secret.
+apiKey:
+  existingSecret: ""
+  key: api-key
+
+# Ed25519 PKCS#8 PEM signing key for RFC 6962 Signed Tree Heads. Required when
+# config.environment=prod and config.checkpointSigning=true.
+signingKey:
+  existingSecret: ""
+  key: signing-key.pem
+  mountPath: /etc/aegis/signing
+
+# Declarative firewall policy (YAML) from an existing ConfigMap.
+policy:
+  existingConfigMap: ""
+  key: policy.yaml
+  mountPath: /etc/aegis/policy
+
+networkPolicy:
+  enabled: true
+  # Sources allowed to reach the service port. Empty allows any source, but
+  # still only on port 8000. Entries are NetworkPolicyPeer objects, e.g.
+  #   - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: agents}}
+  ingressFrom: []
+  # Egress is default-deny except DNS and the destinations declared here.
+  dns:
+    enabled: true
+    # Peers allowed to serve DNS. Empty allows port 53 to any destination.
+    to: []
+  # Upstream MCP servers, e.g.
+  #   - cidr: 10.20.0.0/16
+  #     ports: [{port: 443, protocol: TCP}]
+  egressUpstreams: []
+  # OpenTelemetry collector egress, e.g. {cidr: 10.30.0.10/32, port: 4318}.
+  otlp:
+    cidr: ""
+    port: 4318
+
+# Horizontal scaling is DISABLED. Running more than one replica against the
+# SQLite ledger forks the hash chain (each pod becomes an independent writer).
+# Keep this off until the `[persistence/postgres-ledger]` backend exists; the
+# HPA template is gated here only for that future backend.
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+
+# A PodDisruptionBudget on a single replica would block node drains forever;
+# it only makes sense together with a multi-writer ledger backend.
+pdb:
+  enabled: false
+  maxUnavailable: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+terminationGracePeriodSeconds: 30
