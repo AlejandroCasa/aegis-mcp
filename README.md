@@ -30,6 +30,9 @@ Aegis-MCP sits between AI Agents (Claude Desktop, Cursor, autonomous orchestrato
   - DLP-scrubbed structured JSON logs with `trace_id`, `span_id`, `request_id` (`X-Request-Id`), `decision` and `risk_score`; Grafana dashboard [`deploy/grafana/aegis-mcp.json`](deploy/grafana/aegis-mcp.json) and `PrometheusRule` alerts [`deploy/prometheus/aegis-mcp-rules.yaml`](deploy/prometheus/aegis-mcp-rules.yaml) (p99 > 10 ms, toxic-flow / tool-drift spikes, chain/checkpoint errors).
 - **4-Phase Zero-Tolerance CI/CD & Container Hardening**:
   - Multi-stage [`Dockerfile`](Dockerfile) running under `UID 10001` (`appuser`) with Kubernetes manifests ([`k8s/`](k8s/)) and OPA/Rego policies ([`policy/`](policy/)).
+- **Threat Model, Security Policy & Compliance Mapping**:
+  - [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md): STRIDE analysis for every trust boundary (MCP client, gateway transports, upstream servers, audit ledger and Ed25519 checkpoints, operators, webhooks/OTLP), a residual risk register, and a control matrix against the OWASP LLM Top 10 2025, OWASP Agentic AI Threats, MITRE ATLAS, NIST AI RMF, the EU AI Act (Art. 12 & 14) and ISO/IEC 42001.
+  - [`SECURITY.md`](SECURITY.md): supported versions, private vulnerability disclosure (GitHub Security Advisories), response targets, and how to verify releases (cosign, SLSA) and the audit ledger (`scripts/verify_ledger.py`).
 
 ---
 
@@ -285,4 +288,4 @@ The corpus keeps 9 documented false negatives, each labeled `known gap` in its `
 
 ## 🗺️ Architecture Roadmap
 
-See [BACKLOG.md](BACKLOG.md) for the prioritized engineering backlog.
+See [BACKLOG.md](BACKLOG.md) for the prioritized engineering backlog. Security-relevant changes must keep [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) up to date. Report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
