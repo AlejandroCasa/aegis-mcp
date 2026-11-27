@@ -1,0 +1,17 @@
+{{- /*
+Disabled by default: with a single SQLite writer a PDB would either block node
+drains forever or protect nothing. Enable together with a multi-writer ledger.
+*/ -}}
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "aegis-mcp.fullname" . }}
+  labels:
+    {{- include "aegis-mcp.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "aegis-mcp.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -1,0 +1,20 @@
+apiVersion: v2
+name: aegis-mcp
+description: >-
+  Zero-Trust Firewall, DLP Redactor & Cryptographic Audit Proxy for Model
+  Context Protocol (MCP) servers. Single-writer StatefulSet with a persistent
+  hash-chained SQLite audit ledger, PSS "restricted" pod hardening and a
+  default-deny egress NetworkPolicy.
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/AlejandroCasa/aegis-mcp
+sources:
+  - https://github.com/AlejandroCasa/aegis-mcp
+keywords:
+  - mcp
+  - firewall
+  - dlp
+  - audit
+  - zero-trust

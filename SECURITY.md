@@ -23,7 +23,7 @@ The full STRIDE threat model, residual risk register and regulatory control matr
 Report privately through one of these channels:
 
 1. **GitHub Security Advisories (preferred)**: open a draft advisory from the repository's **Security → Advisories → Report a vulnerability** page. This gives us a private workspace and lets us request a CVE.
-2. **Email**: `<SECURITY_CONTACT_EMAIL>`, subject line starting with `[aegis-mcp security]`.
+2. **Email**: `a.casarodriguez@gmail.com`, subject line starting with `[aegis-mcp security]`.
 
 Include, where possible:
 

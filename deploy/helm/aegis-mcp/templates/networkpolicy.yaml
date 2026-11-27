@@ -1,0 +1,57 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Default-deny: both policy types are declared, so any traffic not matched by
+# the rules below (including all egress except DNS, the declared MCP upstreams
+# and the OTLP collector) is dropped.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aegis-mcp.fullname" . }}
+  labels:
+    {{- include "aegis-mcp.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aegis-mcp.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 8000
+          protocol: TCP
+      {{- with $np.ingressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  egress:
+    {{- if $np.dns.enabled }}
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      {{- with $np.dns.to }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- range $np.egressUpstreams }}
+    - to:
+        - ipBlock:
+            cidr: {{ required "networkPolicy.egressUpstreams[].cidr is required" .cidr }}
+      ports:
+        {{- range (required "networkPolicy.egressUpstreams[].ports is required" .ports) }}
+        - port: {{ .port }}
+          protocol: {{ default "TCP" .protocol }}
+        {{- end }}
+    {{- end }}
+    {{- if $np.otlp.cidr }}
+    - to:
+        - ipBlock:
+            cidr: {{ $np.otlp.cidr }}
+      ports:
+        - port: {{ $np.otlp.port }}
+          protocol: TCP
+    {{- end }}
+{{- end }}

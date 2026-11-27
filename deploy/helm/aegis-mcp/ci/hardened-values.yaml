@@ -1,0 +1,33 @@
+# Values used by `helm lint` / `helm template | conftest` in CI and by
+# tests/test_helm_and_release.py. They reference (not embed) Secrets.
+signingKey:
+  existingSecret: aegis-signing-key
+apiKey:
+  existingSecret: aegis-api-key
+policy:
+  existingConfigMap: aegis-policy
+config:
+  mcpUpstreams:
+    filesystem: http://mcp-filesystem.mcp.svc.cluster.local:9000
+  otelEndpoint: http://otel-collector.observability.svc.cluster.local:4318
+networkPolicy:
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: agents
+  dns:
+    to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+  egressUpstreams:
+    - cidr: 10.20.0.0/16
+      ports:
+        - port: 9000
+          protocol: TCP
+  otlp:
+    cidr: 10.30.0.10/32
+    port: 4318

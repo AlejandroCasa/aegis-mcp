@@ -27,7 +27,7 @@ from app.merkle import SignedTreeHead, leaf_hash
 from app.schemas import AuditEntry
 
 OCSF_VERSION = "1.3.0"
-PRODUCT_VERSION = "0.1.0"
+PRODUCT_VERSION = "0.2.0"
 API_ACTIVITY_CLASS_UID = 6003
 APPLICATION_ACTIVITY_CATEGORY_UID = 6
 ACTIVITY_OTHER = 99

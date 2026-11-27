@@ -1,0 +1,30 @@
+Aegis-MCP {{ .Chart.AppVersion }} is deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+1. Reach the gateway (ingress is restricted to port 8000 by the NetworkPolicy):
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "aegis-mcp.fullname" . }} 8000:{{ .Values.service.port }}
+   curl -s http://127.0.0.1:8000/healthz
+
+2. Audit ledger: SQLite at {{ .Values.persistence.mountPath }}/{{ .Values.config.dbFile }}
+{{- if .Values.persistence.enabled }}
+   (PVC "data-{{ include "aegis-mcp.fullname" . }}-0", retained on uninstall).
+{{- else }}
+   WARNING: persistence.enabled=false — the hash-chained ledger lives in an
+   emptyDir and is LOST on every pod restart. Do not run this in production.
+{{- end }}
+
+   Verify the chain: curl -s -H "X-API-Key: $AEGIS_API_KEY" http://127.0.0.1:8000/api/v1/audit/verify
+
+3. Single writer: replicas are pinned to 1 and HPA/PDB are disabled
+   (autoscaling.enabled={{ .Values.autoscaling.enabled }}, pdb.enabled={{ .Values.pdb.enabled }}).
+   Multiple SQLite replicas would fork the audit hash chain until the
+   [persistence/postgres-ledger] backend exists.
+
+4. Egress is default-deny (DNS{{ if .Values.networkPolicy.otlp.cidr }}, OTLP {{ .Values.networkPolicy.otlp.cidr }}:{{ .Values.networkPolicy.otlp.port }}{{ end }}{{ if .Values.networkPolicy.egressUpstreams }}, {{ len .Values.networkPolicy.egressUpstreams }} declared upstream(s){{ end }} only).
+   Declare MCP upstreams under networkPolicy.egressUpstreams.
+
+5. Verify the image signature before rollout:
+
+   cosign verify {{ include "aegis-mcp.image" . }} \
+     --certificate-identity-regexp '^https://github.com/AlejandroCasa/aegis-mcp/' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com

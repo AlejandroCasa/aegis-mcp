@@ -100,7 +100,7 @@ app = FastAPI(
         "Zero-Trust Firewall, DLP Redactor & Tamper-Evident Cryptographic "
         "Audit Proxy for Model Context Protocol (MCP) Servers."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 app.add_middleware(ObservabilityMiddleware)

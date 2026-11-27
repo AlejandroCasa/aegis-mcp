@@ -1,0 +1,15 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/).
+#
+# unpinned-uses: release.yml pins every action to an exact, immutable-by-
+# convention release tag (vX.Y.Z; tests/test_helm_and_release.py rejects
+# floating majors, @main and @master). `ref-pin` still flags any `uses:`
+# without a ref. The SLSA L3 container generator cannot be hash-pinned at
+# all: slsa-verifier checks its builder identity against `refs/tags/vX.Y.Z`.
+# TODO(release-train): convert the remaining tags to commit SHAs
+# (`zizmor --fix` / pinact, online) and tighten "*" back to hash-pin.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "slsa-framework/slsa-github-generator/*": ref-pin
+        "*": ref-pin

@@ -1,0 +1,216 @@
+name: Release — Multi-Arch Image, CycloneDX SBOM, Cosign & SLSA L3
+
+# Runs only on version tags cut by the human release train (e.g. v0.2.0).
+on:
+  push:
+    tags: ["v*"]
+
+# Deny-all by default; every job opts into the minimum it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  CHART_DIR: deploy/helm/aegis-mcp
+  CONFTEST_VERSION: "0.56.0"
+
+jobs:
+  # ===========================================================================
+  # 1. Release consistency + hardened Helm chart validation (OPA/Rego)
+  # ===========================================================================
+  chart:
+    name: Version Consistency & Helm Chart Policy Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Assert tag == pyproject == Chart.yaml == CHANGELOG
+        run: python3 -m scripts.check_release_version --tag "${GITHUB_REF_NAME}"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.2
+
+      - name: Install conftest (checksum-verified)
+        working-directory: ${{ runner.temp }}
+        run: |
+          base="https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}"
+          archive="conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSLO "${base}/${archive}"
+          curl -fsSLO "${base}/checksums.txt"
+          sha256sum --check --ignore-missing checksums.txt
+          tar -xzf "${archive}" conftest
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      - name: Helm lint (strict)
+        run: helm lint --strict "${CHART_DIR}" -f "${CHART_DIR}/ci/hardened-values.yaml"
+
+      - name: Render chart and enforce PSS restricted / default-deny policy
+        run: |
+          helm template aegis "${CHART_DIR}" -f "${CHART_DIR}/ci/hardened-values.yaml" \
+            > "${RUNNER_TEMP}/rendered.yaml"
+          conftest test "${RUNNER_TEMP}/rendered.yaml" --policy policy/helm.rego
+
+      - name: Fail-closed guard rejects multi-replica SQLite ledger
+        run: |
+          if helm template aegis "${CHART_DIR}" -f "${CHART_DIR}/ci/hardened-values.yaml" \
+               --set replicaCount=2 > /dev/null 2>&1; then
+            echo "replicaCount=2 must be rejected (hash-chain fork)" >&2
+            exit 1
+          fi
+
+  # ===========================================================================
+  # 2. Multi-arch build + push, CycloneDX SBOM, cosign keyless sign & attest
+  # ===========================================================================
+  image:
+    name: Multi-Arch Image, SBOM & Cosign Keyless Signature
+    needs: chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # Sigstore Fulcio keyless OIDC + GitHub attestations
+      attestations: write # actions/attest-sbom
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Compute lowercase image reference
+        id: ref
+        run: echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3.6.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.10.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive OCI tags and labels
+        id: meta
+        uses: docker/metadata-action@v5.7.0
+        with:
+          images: ${{ steps.ref.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      # No build cache on the release path (cache-poisoning hardening); SLSA
+      # provenance comes from the isolated L3 generator below, not buildkit.
+      - name: Build and push linux/amd64 + linux/arm64
+        id: build
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Generate CycloneDX SBOM (Syft)
+        uses: anchore/sbom-action@v0.18.0
+        with:
+          image: ${{ steps.ref.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: aegis-mcp-sbom.cdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Cosign keyless sign + attest SBOM (by digest)
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign attest --yes --type cyclonedx \
+            --predicate aegis-mcp-sbom.cdx.json "${IMAGE}@${DIGEST}"
+
+      - name: GitHub SBOM attestation
+        uses: actions/attest-sbom@v2.2.0
+        with:
+          subject-name: ${{ steps.ref.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: aegis-mcp-sbom.cdx.json
+          push-to-registry: true
+
+  # ===========================================================================
+  # 3. SLSA Build Level 3 provenance (isolated reusable workflow).
+  #    The generator MUST be referenced by its release tag, not a commit SHA:
+  #    its builder identity is verified against `refs/tags/vX.Y.Z`.
+  # ===========================================================================
+  provenance:
+    name: SLSA L3 Provenance
+    needs: image
+    permissions:
+      actions: read # read workflow run metadata
+      id-token: write # sign provenance via Sigstore
+      packages: write # attach provenance to the image in ghcr.io
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.image.outputs.image }}
+      digest: ${{ needs.image.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # 4. Verify signature, SBOM attestation and SLSA provenance before done
+  # ===========================================================================
+  verify:
+    name: Verify Signature, SBOM & Provenance
+    needs: [image, provenance]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cosign verify (signature, SBOM, SLSA provenance)
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          ref="${IMAGE}@${DIGEST}"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          cosign verify "${ref}" \
+            --certificate-oidc-issuer "${ISSUER}" --certificate-identity "${identity}"
+          cosign verify-attestation "${ref}" --type cyclonedx \
+            --certificate-oidc-issuer "${ISSUER}" --certificate-identity "${identity}"
+          cosign verify-attestation "${ref}" --type slsaprovenance \
+            --certificate-oidc-issuer "${ISSUER}" \
+            --certificate-identity-regexp '^https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
